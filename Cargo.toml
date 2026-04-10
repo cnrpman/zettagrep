@@ -1,0 +1,14 @@
+[package]
+name = "zg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Small query-normalization helpers for the zg search tooling."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/zg"
+keywords = ["search", "query", "text", "normalize", "cli"]
+categories = ["text-processing", "command-line-utilities"]
+include = ["Cargo.toml", "README.md", "src/**/*.rs"]
+
+[dependencies]
