@@ -20,6 +20,9 @@ Date: 2026-04-11
 - 本地优先，索引跟着目录走，而不是先上中心化服务
 - `regex` 是基础能力，不被语义检索吞掉
 - v1 优先固定默认值，不急着把内部策略暴露成大量配置项
+- 除了我们自己的 bm25 + semantic / hybrid recall 层之外，其它低层能力如无必要尽可能复用成熟上游，尤其是 ripgrep crates
+- 保持单二进制发布；如无必要，尽可能复用 ripgrep crates
+- 继续保留后端抽象边界，为未来的多后端支持留口子
 - 默认工作负载是写多于搜的本地记忆型文档库
 - 默认新鲜度模型是 lazy-first：写入不强制同步，搜索时按需同步当前范围
 - 当前行为应可见、可解释，但不等于必须可配置
@@ -31,7 +34,7 @@ Date: 2026-04-11
 
 - 对未建立索引的目录：
   - 如果查询是 regex，走常规文件遍历 + `regex` 搜索
-  - 如果查询不是 regex，可在当前搜索范围懒初始化本地 `.zg/`，然后执行 hybrid recall
+  - 如果查询不是 regex，可在当前搜索范围建立目录级本地 `.zg/`，然后执行 hybrid recall
 - 对已建立索引的目录：使用最近祖先 `.zg/` 对应的本地索引执行 hybrid recall
 - 如果查询是 `regex` 格式，则永远按常规 `regex` 搜索执行，不走 `FTS` 或向量检索
 
@@ -48,7 +51,7 @@ Date: 2026-04-11
 - 在被索引目录下创建隐藏索引目录 `.zg/`
 - 支持嵌套 `.zg/`
 - 搜索时按最近祖先 `.zg/` 解析索引根
-- 无祖先 `.zg/` 的非 regex 查询可懒初始化当前搜索范围的本地索引
+- 无祖先 `.zg/` 的非 regex 查询可在搜索请求内建立当前搜索范围的目录级本地索引
 - 搜索前对当前范围按需刷新 dirty 内容
 - 建立基于 `SQLite3` 的元数据、全文索引、向量索引
 - 提供最小可用 CLI：
@@ -95,7 +98,8 @@ v1 预期至少包含：
 - 允许嵌套 `.zg/`
 - 父级 `.zg/` 仍然覆盖整个 subtree；子级 `.zg/` 是局部增强，不是排他替代
 - 搜索时优先使用离目标路径最近的祖先 `.zg/`
-- 如果没有祖先 `.zg/` 且 query 不是 regex，可在当前搜索范围懒初始化新的 `.zg/`
+- 如果没有祖先 `.zg/` 且 query 不是 regex，可在当前搜索范围建立新的目录级 `.zg/`
+- 如果搜索路径是单个文件且没有祖先 `.zg/`，目录级索引根默认取该文件的父目录
 - 文件变更时，所有覆盖该文件的索引都要更新
 - 如果搜索使用的是父级索引且当前范围内 recall 明显差，只做 non-blocking 提示，建议用户在该范围加一层索引，并明确提示成本
 
@@ -149,7 +153,7 @@ v1 不依赖“猜测 query 是什么意思”。
 前提：
 
 - 目标路径有祖先 `.zg/`
-- 或目标路径在本次搜索中被懒初始化为新的 `.zg/`
+- 或目标路径在本次搜索中被建立为新的目录级 `.zg/`
 
 行为：
 
@@ -162,7 +166,8 @@ v1 不依赖“猜测 query 是什么意思”。
 
 如果没有可用祖先 `.zg/` 且 query 不是 regex：
 
-- 在当前搜索范围懒初始化本地 `.zg/`
+- 在当前搜索范围建立目录级本地 `.zg/`
+- 如果当前路径是文件，则目录级索引根取其父目录
 - 完成必要的首次建库后返回 indexed hybrid recall 结果
 - 不做 blocking 交互
 
@@ -273,6 +278,9 @@ v1 锁接口，不锁具体 provider。
 - indexed search 的目标路径是 hybrid recall
 - backend 可以是本地模型，也可以是外部 API，但都必须通过统一抽象接入
 - 搜索时如果当前范围发现 dirty chunk，应优先补齐该范围所需的 embedding，而不是长期把向量信号降级为可无
+- macOS first 的分发路径优先假设本地模型随包预置，而不是首次搜索临时下载
+- 模型资源优先查找 `<prefix>/share/zg/models`，并允许 `ZG_MODEL_DIR` 显式覆盖
+- 如果没有预置模型，v1 直接报错；不提供 adhoc 下载 fallback
 
 原因：
 
@@ -297,7 +305,8 @@ zg index init ~/code/my-repo
 说明：
 
 - `zg index init` 是显式入口，但不是唯一入口
-- 非 regex 的 `zg <query> [path]` 也可以触发 lazy index initialization
+- 非 regex 的 `zg <query> [path]` 也可以触发目录级索引创建,随后再做按需 reconcile,并对这次搜索需要的内容立即补做 embedding 后写回缓存
+- 如果用户明确执行 `zg index init` / `zg index rebuild`,系统可以在该显式路径中做全量预建或重建,包括把需要的 embedding 缓存提前准备好
 
 ### 常规 regex 搜索
 
@@ -324,7 +333,7 @@ zg search 'sqlite vector adapter'
 特点：
 
 - 默认解析最近祖先 `.zg/`
-- 如果没有祖先 `.zg/` 且 query 不是 regex，可直接懒初始化当前搜索范围的 `.zg/` 后返回结果
+- 如果没有祖先 `.zg/` 且 query 不是 regex，可直接在当前搜索范围建立目录级 `.zg/` 后返回结果
 - 默认走 hybrid recall
 
 ### 查看状态
@@ -369,7 +378,7 @@ zg index status ~/code/my-repo
 - `zg <query> [path]` 应能直接给出合理结果
 - 常见 flag 的语义要尽量贴近既有习惯
 - 如果无法与既有习惯对齐，宁可先不提供该 flag，也不要复用同名但不同义的 flag
-- 无索引场景必须是一等公民；必要时可通过 lazy index initialization 返回完整结果
+- 无索引场景必须是一等公民；必要时可通过目录级索引创建,加按需 reconcile,再对这次搜索需要的内容立即补做 embedding 并写缓存来返回完整结果。与此同时,用户仍可选择显式触发全量预建。
 
 ### 2. Index Is Local State, Not Cloud State
 
@@ -382,6 +391,13 @@ zg index status ~/code/my-repo
 ### 4. One Storage Engine First
 
 先把 `SQLite3` 这条路走通，不要过早拆成多引擎。
+
+### 4.1 Single Binary, Abstracted Backends
+
+- 分发形态保持单二进制
+- `grep/scan` 路径优先复用 ripgrep crates
+- 只有 bm25 + semantic / hybrid recall 这一层保留 `zg` 自己的产品逻辑
+- 复用上游能力时仍保留后端抽象，不把主流程直接绑死到单个实现
 
 ### 5. Add Index Methods Without Rewriting The Product Story
 
@@ -401,4 +417,4 @@ zg index status ~/code/my-repo
 
 ## 一句话总结
 
-先把 `zg` 做成一个坚实的本地 filesystem query substrate：regex 路径始终像 `grep`，非 regex 路径在需要时可懒初始化本地索引并返回 hybrid recall 结果，未来再往上接更多索引方法，而不是一开始就把所有野心压成一句空话。
+先把 `zg` 做成一个坚实的本地 filesystem query substrate：regex 路径始终像 `grep`，非 regex 路径在需要时可建立本地目录级索引并返回 hybrid recall 结果；默认是在搜索命中需要的范围时立即补做并写缓存，但用户也可以显式触发全量预建，未来再往上接更多索引方法，而不是一开始就把所有野心压成一句空话。

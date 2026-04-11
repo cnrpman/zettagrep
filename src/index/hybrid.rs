@@ -7,11 +7,11 @@ use rusqlite::{Connection, params};
 use crate::{Query, ZgResult};
 
 use super::db::{ensure_index_root, open_existing_db, validate_schema};
+use super::embed::embed_query;
 use super::types::{
     FTS_CANDIDATE_LIMIT, RRF_K, ScopeKind, SearchHit, StoredChunk, VECTOR_CANDIDATE_LIMIT,
-    VECTOR_DIMENSIONS,
 };
-use super::util::{fnv1a64, scope_kind};
+use super::util::scope_kind;
 
 pub fn search_hybrid(
     root: &Path,
@@ -30,83 +30,10 @@ pub fn search_hybrid(
         return Err(crate::other("query is empty"));
     }
 
-    let query_vector = vectorize(normalized.normalized());
+    let query_vector = embed_query(normalized.normalized())?;
     let lexical_rows = lexical_candidates(&conn, &root, &scope, &normalized)?;
     let vector_rows = vector_candidates(&conn, &root, &scope, &query_vector)?;
-
-    let mut by_chunk = HashMap::<i64, StoredChunk>::new();
-    let mut lexical_rank = HashMap::<i64, usize>::new();
-    let mut vector_rank = HashMap::<i64, usize>::new();
-
-    for (rank, row) in lexical_rows.into_iter().enumerate() {
-        lexical_rank.insert(row.chunk_id, rank);
-        by_chunk.insert(row.chunk_id, row);
-    }
-    for (rank, row) in vector_rows.into_iter().enumerate() {
-        vector_rank.insert(row.chunk_id, rank);
-        by_chunk
-            .entry(row.chunk_id)
-            .and_modify(|existing| {
-                existing.vector_score = row.vector_score;
-                if existing.raw_text.is_empty() {
-                    existing.raw_text = row.raw_text.clone();
-                }
-                if existing.rel_path.is_empty() {
-                    existing.rel_path = row.rel_path.clone();
-                }
-            })
-            .or_insert(row);
-    }
-
-    let mut hits = by_chunk
-        .into_values()
-        .filter(|row| row.lexical_score > 0.0 || row.vector_score > 0.0)
-        .map(|row| {
-            let lexical_rrf = lexical_rank
-                .get(&row.chunk_id)
-                .map(|rank| 1.0 / (RRF_K + *rank as f64))
-                .unwrap_or(0.0);
-            let vector_rrf = vector_rank
-                .get(&row.chunk_id)
-                .map(|rank| 1.0 / (RRF_K + *rank as f64))
-                .unwrap_or(0.0);
-            SearchHit {
-                rel_path: row.rel_path,
-                snippet: render_snippet(&row.raw_text),
-                score: lexical_rrf + vector_rrf,
-                lexical_score: row.lexical_score,
-                vector_score: row.vector_score,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                right
-                    .lexical_score
-                    .partial_cmp(&left.lexical_score)
-                    .unwrap_or(Ordering::Equal)
-            })
-            .then_with(|| left.rel_path.cmp(&right.rel_path))
-    });
-    hits.truncate(limit);
-    Ok(hits)
-}
-
-pub(crate) fn vectorize(text: &str) -> Vec<f32> {
-    let mut vector = vec![0.0; VECTOR_DIMENSIONS];
-    for token in text.split_whitespace() {
-        let hash = fnv1a64(token.as_bytes());
-        let index = (hash as usize) % VECTOR_DIMENSIONS;
-        let sign = if ((hash >> 8) & 1) == 0 { 1.0 } else { -1.0 };
-        vector[index] += sign;
-    }
-    normalize_vector(&mut vector);
-    vector
+    Ok(merge_ranked_hits(lexical_rows, vector_rows, limit))
 }
 
 pub(crate) fn encode_vector(vector: &[f32]) -> Vec<u8> {
@@ -265,6 +192,74 @@ fn vector_candidates(
     Ok(out)
 }
 
+fn merge_ranked_hits(
+    lexical_rows: Vec<StoredChunk>,
+    vector_rows: Vec<StoredChunk>,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let mut by_chunk = HashMap::<i64, StoredChunk>::new();
+    let mut lexical_rank = HashMap::<i64, usize>::new();
+    let mut vector_rank = HashMap::<i64, usize>::new();
+
+    for (rank, row) in lexical_rows.into_iter().enumerate() {
+        lexical_rank.insert(row.chunk_id, rank);
+        by_chunk.insert(row.chunk_id, row);
+    }
+    for (rank, row) in vector_rows.into_iter().enumerate() {
+        vector_rank.insert(row.chunk_id, rank);
+        by_chunk
+            .entry(row.chunk_id)
+            .and_modify(|existing| {
+                existing.vector_score = row.vector_score;
+                if existing.raw_text.is_empty() {
+                    existing.raw_text = row.raw_text.clone();
+                }
+                if existing.rel_path.is_empty() {
+                    existing.rel_path = row.rel_path.clone();
+                }
+            })
+            .or_insert(row);
+    }
+
+    let mut hits = by_chunk
+        .into_values()
+        .filter(|row| row.lexical_score > 0.0 || row.vector_score > 0.0)
+        .map(|row| {
+            let lexical_rrf = lexical_rank
+                .get(&row.chunk_id)
+                .map(|rank| 1.0 / (RRF_K + *rank as f64))
+                .unwrap_or(0.0);
+            let vector_rrf = vector_rank
+                .get(&row.chunk_id)
+                .map(|rank| 1.0 / (RRF_K + *rank as f64))
+                .unwrap_or(0.0);
+            SearchHit {
+                rel_path: row.rel_path,
+                snippet: render_snippet(&row.raw_text),
+                score: lexical_rrf + vector_rrf,
+                lexical_score: row.lexical_score,
+                vector_score: row.vector_score,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .lexical_score
+                    .partial_cmp(&left.lexical_score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.rel_path.cmp(&right.rel_path))
+    });
+    hits.truncate(limit);
+    hits
+}
+
 fn lexical_score(text: &str, query: &Query, bm25: f64) -> f64 {
     let coverage = query
         .terms()
@@ -273,15 +268,6 @@ fn lexical_score(text: &str, query: &Query, bm25: f64) -> f64 {
         .count() as f64
         / query.terms().len().max(1) as f64;
     coverage + (-bm25).max(0.0)
-}
-
-fn normalize_vector(vector: &mut [f32]) {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for value in vector {
-            *value /= norm;
-        }
-    }
 }
 
 fn decode_vector(bytes: &[u8]) -> Vec<f32> {
@@ -331,4 +317,69 @@ fn render_snippet(raw_text: &str) -> String {
         cutoff -= 1;
     }
     format!("{}...", &snippet[..cutoff])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StoredChunk, merge_ranked_hits};
+
+    fn row(
+        chunk_id: i64,
+        rel_path: &str,
+        raw_text: &str,
+        lexical: f64,
+        vector: f64,
+    ) -> StoredChunk {
+        StoredChunk {
+            chunk_id,
+            rel_path: rel_path.to_string(),
+            raw_text: raw_text.to_string(),
+            lexical_score: lexical,
+            vector_score: vector,
+        }
+    }
+
+    #[test]
+    fn hybrid_merge_keeps_lexical_only_and_vector_only_candidates_visible() {
+        let hits = merge_ranked_hits(
+            vec![row(1, "alpha.md", "alpha lexical hit", 2.0, 0.0)],
+            vec![row(2, "beta.md", "beta vector hit", 0.0, 0.9)],
+            10,
+        );
+
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rel_path == "alpha.md" && hit.lexical_score > 0.0)
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rel_path == "beta.md" && hit.vector_score > 0.0)
+        );
+    }
+
+    #[test]
+    fn hybrid_merge_rewards_dual_channel_hits() {
+        let hits = merge_ranked_hits(
+            vec![
+                row(1, "alpha.md", "alpha both", 1.5, 0.0),
+                row(2, "beta.md", "beta lexical only", 1.4, 0.0),
+            ],
+            vec![
+                row(1, "alpha.md", "alpha both", 0.0, 0.8),
+                row(3, "gamma.md", "gamma vector only", 0.0, 0.7),
+            ],
+            10,
+        );
+
+        assert_eq!(hits[0].rel_path, "alpha.md");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rel_path == "beta.md" && hit.lexical_score > 0.0)
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rel_path == "gamma.md" && hit.vector_score > 0.0)
+        );
+    }
 }

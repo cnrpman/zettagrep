@@ -9,8 +9,7 @@ use zg::{ZgResult, other};
 #[derive(Debug, PartialEq)]
 enum SearchMode {
     Regex,
-    Indexed(PathBuf),
-    Fallback,
+    Indexed,
 }
 
 fn main() -> ExitCode {
@@ -111,7 +110,19 @@ fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
     let requested = resolve_path_arg(path.and_then(|value| value.to_str()))?;
     match resolve_search_mode(query, &requested) {
         SearchMode::Regex => run_grep(query, Some(&requested)),
-        SearchMode::Indexed(root) => {
+        SearchMode::Indexed => {
+            let (root, init_stats) = index::ensure_index_root_for_search(&requested)?;
+            if let Some(stats) = init_stats {
+                eprintln!(
+                    "note: no ancestor .zg index found; initializing local index at {} for this search ({} files / {} chunks)",
+                    root.display(),
+                    stats.indexed_files,
+                    stats.chunks_indexed,
+                );
+                if let Some(note) = index::best_effort_overlap_note(&root)? {
+                    eprintln!("{note}");
+                }
+            }
             index::reconcile_covering_roots(&requested)?;
             let hits = index::search_hybrid(&root, &requested, query, 20)?;
             for hit in hits {
@@ -122,18 +133,6 @@ fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
             }
             Ok(())
         }
-        SearchMode::Fallback => {
-            let hits = search::fallback_query_search(query, &requested)?;
-            for hit in hits {
-                println!("{}:{}:{}", hit.path.display(), hit.line_number, hit.line);
-            }
-            println!(
-                "note: {} has no ancestor .zg index; run `zg index init {}` if you want faster local hybrid recall here",
-                requested.display(),
-                requested.display()
-            );
-            Ok(())
-        }
     }
 }
 
@@ -142,20 +141,8 @@ fn resolve_search_mode(query: &str, requested: &Path) -> SearchMode {
         return SearchMode::Regex;
     }
 
-    if let Some(root) = index_root_for_search(requested) {
-        return SearchMode::Indexed(root);
-    }
-
-    SearchMode::Fallback
-}
-
-fn index_root_for_search(path: &Path) -> Option<PathBuf> {
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir().ok()?.join(path)
-    };
-    zg::paths::find_index_root(&resolved)
+    let _ = requested;
+    SearchMode::Indexed
 }
 
 fn resolve_dir_arg(path: Option<&str>) -> ZgResult<PathBuf> {
@@ -183,38 +170,48 @@ fn parse_query_and_path(args: &[String]) -> ZgResult<(String, Option<PathBuf>)> 
 }
 
 fn print_status(status: &IndexStatus) {
-    println!("requested path: {}", status.requested_path.display());
-    println!(
+    print!("{}", format_status(status));
+}
+
+fn format_status(status: &IndexStatus) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "requested path: {}",
+        status.requested_path.display()
+    ));
+    lines.push(format!(
         "index root: {}",
         status
             .index_root
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "none".to_string())
-    );
-    println!("indexed: {}", yes_no(status.indexed));
-    println!("chunking: {}", status.chunk_mode);
-    println!("marker: {}", status.chunk_marker);
-    println!("scope policy: {}", status.scope_policy);
-    println!("dirty: {}", yes_no(status.dirty));
-    println!(
+    ));
+    lines.push(format!("indexed: {}", yes_no(status.indexed)));
+    lines.push(format!("chunking: {}", status.chunk_mode));
+    lines.push(format!("marker: {}", status.chunk_marker));
+    lines.push(format!("scope policy: {}", status.scope_policy));
+    lines.push(format!("walk policy: {}", status.walk_policy));
+    lines.push(format!("dirty: {}", yes_no(status.dirty)));
+    lines.push(format!(
         "dirty reason: {}",
         status
             .dirty_reason
             .clone()
             .unwrap_or_else(|| "none".to_string())
-    );
-    println!("files: {}", status.file_count);
-    println!("chunks: {}", status.chunk_count);
-    println!("fts ready: {}", yes_no(status.fts_ready));
-    println!("vector ready: {}", yes_no(status.vector_ready));
-    println!(
+    ));
+    lines.push(format!("files: {}", status.file_count));
+    lines.push(format!("chunks: {}", status.chunk_count));
+    lines.push(format!("fts ready: {}", yes_no(status.fts_ready)));
+    lines.push(format!("vector ready: {}", yes_no(status.vector_ready)));
+    lines.push(format!(
         "last sync unix ms: {}",
         status
             .last_sync_unix_ms
             .map(|value| value.to_string())
             .unwrap_or_else(|| "never".to_string())
-    );
+    ));
+    lines.join("\n") + "\n"
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -236,7 +233,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{SearchMode, resolve_search_mode};
+    use super::{SearchMode, format_status, resolve_search_mode};
     use zg::index;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -249,23 +246,49 @@ mod tests {
         dir
     }
 
+    fn mark_indexed(root: &std::path::Path) {
+        fs::create_dir_all(root.join(".zg")).unwrap();
+        fs::write(root.join(".zg/index.db"), "").unwrap();
+    }
+
     #[test]
     fn regex_queries_keep_regex_semantics_on_indexed_roots() {
         let root = temp_dir("regex-mode");
-        fs::write(root.join("alpha.txt"), "TODO: keep regex semantics").unwrap();
-        index::init_index(&root).unwrap();
+        mark_indexed(&root);
 
         let mode = resolve_search_mode(r"TODO|FIXME", &root);
         assert_eq!(mode, SearchMode::Regex);
     }
 
     #[test]
-    fn plain_queries_use_fts_on_indexed_roots() {
+    fn plain_queries_use_indexed_hybrid_mode_on_indexed_roots() {
         let root = temp_dir("fts-mode");
-        fs::write(root.join("alpha.txt"), "sqlite vector adapter").unwrap();
-        index::init_index(&root).unwrap();
+        mark_indexed(&root);
 
         let mode = resolve_search_mode("sqlite vector", &root);
-        assert_eq!(mode, SearchMode::Indexed(root));
+        assert_eq!(mode, SearchMode::Indexed);
+    }
+
+    #[test]
+    fn plain_queries_select_indexed_search_pipeline_without_manual_index_setup() {
+        let root = temp_dir("lazy-init-mode");
+        fs::write(root.join("alpha.txt"), "sqlite vector adapter").unwrap();
+
+        // CLI dispatch is intentionally simple: non-regex input enters the indexed-search
+        // pipeline, which then reuses the nearest ancestor .zg or creates one for the
+        // directory search scope before reconcile/embed work runs.
+        let mode = resolve_search_mode("sqlite vector", &root);
+        assert_eq!(mode, SearchMode::Indexed);
+    }
+
+    #[test]
+    fn formatted_status_exposes_walk_policy() {
+        let root = temp_dir("status");
+        let status = index::load_status(&root).unwrap();
+
+        let rendered = format_status(&status);
+        assert!(rendered.contains("walk policy: ripgrep-style:"));
+        assert!(rendered.contains(".zgignore"));
+        assert!(rendered.contains(".zg/ always skipped"));
     }
 }

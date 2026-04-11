@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::paths;
+use crate::walk;
 use crate::{ZgResult, normalize_query};
 
+use super::embed::embed_passages;
 use super::types::{
     ALLOWED_BASENAMES, ALLOWED_EXTENSIONS, DEFAULT_CHUNK_MARKER, DEFAULT_MAX_FILE_BYTES,
     IndexedChunk, IndexedDocument,
@@ -23,10 +25,7 @@ pub fn collect_candidate_files(scope: &Path) -> ZgResult<Vec<PathBuf>> {
     }
 
     let mut builder = WalkBuilder::new(&scope);
-    builder
-        .hidden(false)
-        .standard_filters(true)
-        .add_custom_ignore_filename(".zgignore");
+    walk::apply_content_filters(&mut builder);
 
     let mut files = Vec::new();
     for entry in builder.build() {
@@ -40,41 +39,6 @@ pub fn collect_candidate_files(scope: &Path) -> ZgResult<Vec<PathBuf>> {
             continue;
         }
         if file_type.is_file() && is_candidate_file(path)? {
-            files.push(path.to_path_buf());
-        }
-    }
-
-    Ok(files)
-}
-
-pub fn collect_scan_files(scope: &Path) -> ZgResult<Vec<PathBuf>> {
-    let scope = paths::resolve_existing_path(scope)?;
-    if scope.is_file() {
-        return Ok(if is_scan_file(&scope)? {
-            vec![scope]
-        } else {
-            Vec::new()
-        });
-    }
-
-    let mut builder = WalkBuilder::new(&scope);
-    builder
-        .hidden(false)
-        .standard_filters(true)
-        .add_custom_ignore_filename(".zgignore");
-
-    let mut files = Vec::new();
-    for entry in builder.build() {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        if file_type.is_symlink() || has_zg_component(path) {
-            continue;
-        }
-        if file_type.is_file() && is_scan_file(path)? {
             files.push(path.to_path_buf());
         }
     }
@@ -117,7 +81,7 @@ pub(crate) fn load_indexable_document(path: &Path) -> ZgResult<Option<IndexedDoc
         Err(_) => return Ok(None),
     };
 
-    let chunks = build_chunks(&body);
+    let chunks = build_chunks(&body)?;
     if chunks.is_empty() {
         return Ok(None);
     }
@@ -130,7 +94,7 @@ pub(crate) fn load_indexable_document(path: &Path) -> ZgResult<Option<IndexedDoc
     }))
 }
 
-fn build_chunks(body: &str) -> Vec<IndexedChunk> {
+fn build_chunks(body: &str) -> ZgResult<Vec<IndexedChunk>> {
     let mut chunks = Vec::new();
     for (line_index, line) in body.lines().enumerate() {
         for raw_segment in line.split(DEFAULT_CHUNK_MARKER) {
@@ -152,11 +116,27 @@ fn build_chunks(body: &str) -> Vec<IndexedChunk> {
                 raw_text: cleaned.to_string(),
                 normalized_text: normalized_text.clone(),
                 text_hash: stable_hash(normalized_text.as_bytes()),
-                vector: super::hybrid::vectorize(&normalized_text),
+                vector: Vec::new(),
             });
         }
     }
-    chunks
+
+    let normalized = chunks
+        .iter()
+        .map(|chunk| chunk.normalized_text.clone())
+        .collect::<Vec<_>>();
+    let vectors = embed_passages(&normalized)?;
+    if vectors.len() != chunks.len() {
+        return Err(crate::other(
+            "fastembed returned unexpected embedding count",
+        ));
+    }
+
+    for (chunk, vector) in chunks.iter_mut().zip(vectors.into_iter()) {
+        chunk.vector = vector;
+    }
+
+    Ok(chunks)
 }
 
 fn strip_line_decorator(line: &str) -> &str {
@@ -209,19 +189,6 @@ fn is_candidate_file(path: &Path) -> ZgResult<bool> {
     Ok(bytes_are_text_whitelisted(&bytes))
 }
 
-fn is_scan_file(path: &Path) -> ZgResult<bool> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > DEFAULT_MAX_FILE_BYTES {
-        return Ok(false);
-    }
-    if metadata.file_type().is_symlink() || has_zg_component(path) {
-        return Ok(false);
-    }
-
-    let bytes = fs::read(path)?;
-    Ok(bytes_are_text_whitelisted(&bytes))
-}
-
 fn bytes_are_text_whitelisted(bytes: &[u8]) -> bool {
     if bytes.contains(&0) {
         return false;
@@ -233,4 +200,63 @@ fn bytes_are_text_whitelisted(bytes: &[u8]) -> bool {
     text.chars()
         .filter(|ch| !ch.is_whitespace())
         .all(|ch| !ch.is_control())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::collect_candidate_files;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zg-files-{name}-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn rel_names(root: &Path, paths: Vec<PathBuf>) -> Vec<String> {
+        let mut names = paths
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn candidate_collection_skips_hidden_files_and_zg_state() {
+        let root = temp_dir("hidden");
+        fs::write(root.join("keep.md"), "visible note").unwrap();
+        fs::write(root.join(".hidden.md"), "hidden note").unwrap();
+        fs::create_dir_all(root.join(".zg")).unwrap();
+        fs::write(root.join(".zg/internal.md"), "state note").unwrap();
+
+        let files = rel_names(&root, collect_candidate_files(&root).unwrap());
+        assert_eq!(files, vec!["keep.md"]);
+    }
+
+    #[test]
+    fn candidate_collection_uses_parent_ignore_and_local_zgignore_override() {
+        let root = temp_dir("override");
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(root.join(".ignore"), "*.md\n").unwrap();
+        fs::write(child.join(".zgignore"), "!keep.md\n").unwrap();
+        fs::write(child.join("keep.md"), "keep me").unwrap();
+        fs::write(child.join("blocked.md"), "block me").unwrap();
+
+        let files = rel_names(&child, collect_candidate_files(&child).unwrap());
+        assert_eq!(files, vec!["keep.md"]);
+    }
 }

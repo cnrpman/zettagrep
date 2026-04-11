@@ -12,6 +12,7 @@ categories = ["filesystem", "text-processing", "command-line-utilities"]
 include = ["Cargo.toml", "README.md", "src/**/*.rs"]
 
 [dependencies]
+fastembed = "5.13.2"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"

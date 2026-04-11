@@ -40,10 +40,7 @@ pub(crate) fn ancestor_index_root(root: &Path) -> Option<PathBuf> {
 pub(crate) fn descendant_index_root(root: &Path) -> ZgResult<Option<PathBuf>> {
     let root = paths::resolve_existing_dir(root)?;
     let mut builder = WalkBuilder::new(&root);
-    builder
-        .hidden(false)
-        .standard_filters(true)
-        .max_depth(Some(8));
+    builder.standard_filters(true).max_depth(Some(8));
 
     for entry in builder.build() {
         let entry = entry?;
@@ -81,15 +78,6 @@ pub(crate) fn modified_unix_ms(metadata: &fs::Metadata) -> ZgResult<u64> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64)
-}
-
-pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 pub(crate) fn scope_kind(root: &Path, scope: &Path) -> ZgResult<ScopeKind> {

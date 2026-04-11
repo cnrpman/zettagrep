@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::paths;
+use crate::walk::DEFAULT_WALK_POLICY;
 use crate::{ZgResult, other};
 
 use super::types::{
@@ -210,6 +211,7 @@ pub(crate) fn mark_dirty(root: &Path, reason: &str) -> ZgResult<()> {
         chunk_mode: DEFAULT_CHUNK_MODE,
         chunk_marker: DEFAULT_CHUNK_MARKER,
         scope_policy: DEFAULT_SCOPE_POLICY,
+        walk_policy: DEFAULT_WALK_POLICY,
         dirty: true,
         dirty_reason: Some(reason.to_string()),
         last_sync_unix_ms: None,
@@ -238,6 +240,7 @@ pub(crate) fn write_state_mirror(root: &Path, status: &IndexStatus) -> ZgResult<
         chunk_mode: DEFAULT_CHUNK_MODE,
         chunk_marker: DEFAULT_CHUNK_MARKER,
         scope_policy: DEFAULT_SCOPE_POLICY,
+        walk_policy: DEFAULT_WALK_POLICY,
         dirty: status.dirty,
         dirty_reason: status.dirty_reason.clone(),
         last_sync_unix_ms: status.last_sync_unix_ms,
@@ -413,6 +416,7 @@ pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
         chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
         chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
         scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
+        walk_policy: DEFAULT_WALK_POLICY.to_string(),
         dirty: state.dirty,
         dirty_reason: state.dirty_reason,
         last_sync_unix_ms: state.last_sync_unix_ms,
@@ -434,6 +438,7 @@ pub(crate) fn load_state_mirror_status(
         chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
         chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
         scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
+        walk_policy: DEFAULT_WALK_POLICY.to_string(),
         dirty: false,
         dirty_reason: None,
         last_sync_unix_ms: None,

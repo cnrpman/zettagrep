@@ -1,14 +1,16 @@
 mod db;
+mod embed;
 mod files;
 mod hybrid;
 mod sync;
 mod types;
 mod util;
 
-pub use files::{collect_candidate_files, collect_scan_files};
+pub use files::collect_candidate_files;
 pub use hybrid::search_hybrid;
 pub use sync::{
-    best_effort_overlap_note, init_index, load_status, rebuild_index, reconcile_covering_roots,
+    best_effort_overlap_note, ensure_index_root_for_search, init_index, load_status, rebuild_index,
+    reconcile_covering_roots,
 };
 pub use types::{IndexStatus, RebuildStats, SearchHit};
 
@@ -75,6 +77,44 @@ mod tests {
 
         let active_root = reconcile_covering_roots(&nested).unwrap().unwrap();
         assert_eq!(active_root, nested);
+    }
+
+    #[test]
+    fn ensure_index_root_for_search_creates_directory_index_when_missing() {
+        let root = temp_dir("search-root");
+
+        // When no ancestor chain contains .zg, the search path creates a directory-level
+        // index root first; the lazy part is later reconcile/embed work inside that root.
+        let (index_root, stats) = ensure_index_root_for_search(&root).unwrap();
+        assert_eq!(index_root, root);
+        assert!(stats.is_some());
+        assert!(root.join(".zg/index.db").exists());
+    }
+
+    #[test]
+    fn ensure_index_root_for_search_reuses_nearest_ancestor_before_creating_new_root() {
+        let root = temp_dir("ancestor-root");
+        let child = root.join("notes/daily");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(root.join(".zg")).unwrap();
+        fs::write(root.join(".zg/index.db"), "").unwrap();
+
+        let (index_root, stats) = ensure_index_root_for_search(&child).unwrap();
+        assert_eq!(index_root, root);
+        assert!(stats.is_none());
+        assert!(!child.join(".zg/index.db").exists());
+    }
+
+    #[test]
+    fn ensure_index_root_for_search_uses_parent_directory_for_files_without_ancestor_index() {
+        let root = temp_dir("file-root");
+        let file = root.join("note.md");
+        fs::write(&file, "").unwrap();
+
+        let (index_root, stats) = ensure_index_root_for_search(&file).unwrap();
+        assert_eq!(index_root, root);
+        assert!(stats.is_some());
+        assert!(root.join(".zg/index.db").exists());
     }
 
     #[test]

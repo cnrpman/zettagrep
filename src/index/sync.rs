@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::params;
 
-use crate::paths;
 use crate::ZgResult;
+use crate::paths;
 
 use super::db::{
     create_schema, delete_by_rel_path, ensure_index_root, load_file_rows_for_scope,
@@ -28,6 +28,24 @@ pub fn init_index(root: &Path) -> ZgResult<RebuildStats> {
     write_state_mirror(&root, &status_for_index_root(&root)?)?;
 
     rebuild_index(&root)
+}
+
+pub fn ensure_index_root_for_search(scope: &Path) -> ZgResult<(PathBuf, Option<RebuildStats>)> {
+    let scope = paths::resolve_existing_path(scope)?;
+    if let Some(root) = paths::find_index_root(&scope) {
+        return Ok((root, None));
+    }
+
+    let root = if scope.is_dir() {
+        scope
+    } else {
+        scope.parent().map(Path::to_path_buf).ok_or_else(|| {
+            crate::other("cannot determine directory index root for search-triggered creation")
+        })?
+    };
+
+    let stats = init_index(&root)?;
+    Ok((root, Some(stats)))
 }
 
 pub fn rebuild_index(root: &Path) -> ZgResult<RebuildStats> {

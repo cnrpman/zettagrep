@@ -5,6 +5,7 @@ use std::io;
 pub mod index;
 pub mod paths;
 pub mod search;
+mod walk;
 
 pub type DynError = Box<dyn Error + Send + Sync>;
 pub type ZgResult<T> = Result<T, DynError>;
