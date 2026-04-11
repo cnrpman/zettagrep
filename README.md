@@ -1,29 +1,36 @@
 # zg
 
-`zg` is a small Rust library for query normalization and lightweight matching.
+`zg` is a local-first filesystem query engine.
 
-The `0.1.0` release is intentionally narrow: it gives the future `zg` / zettagrep
-tooling a real, publishable core instead of an empty placeholder crate.
+Without an index it behaves like a regex-oriented grep runner.
+With an index it uses per-directory SQLite state under `.zg/` and serves lazy-first hybrid recall.
 
-## What it does today
+## Current v1 surface
 
-- trims input and folds repeated whitespace
-- lowercases query text for stable matching
-- splits normalized terms
-- checks whether all query terms occur in a candidate string
+- `zg <pattern-or-query> [path]`
+- `zg grep <pattern> [path]`
+- `zg search <query> [path]`
+- `zg index init [path]`
+- `zg index status [path]`
+- `zg index rebuild [path]`
 
-## Example
+## On-disk layout
 
-```rust
-use zg::{matches_query, Query};
+Running `zg index init /some/project` creates:
 
-let query = Query::new("  Rust   Search ");
-assert_eq!(query.normalized(), "rust search");
-assert!(matches_query("rust search", "Rust-powered search tools"));
+```text
+/some/project/.zg/
+  index.db
+  state.json
 ```
 
-## Scope
+`index.db` stores file metadata, chunk rows, FTS5 data, vector rows, and index state.
 
-This crate is deliberately small in 2026. The goal is to stabilize basic query
-handling first, then extend the crate with richer search primitives in later
-releases.
+## Notes
+
+- `zg grep` does not require an index.
+- Regex-shaped input keeps regex semantics even when the target directory is already indexed.
+- `zg search` uses the nearest ancestor `.zg/` root; if none exists, it falls back to scan-based recall.
+- `zg grep` / fallback recall reuse ripgrep-family crates for file walking and regex scanning.
+- `zg` does not run a watcher or daemon in v1. Freshness comes from on-demand reconcile during search.
+- Indexed search uses hybrid recall with lexical and local vector signals together.

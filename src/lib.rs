@@ -1,3 +1,14 @@
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::io;
+
+pub mod index;
+pub mod paths;
+pub mod search;
+
+pub type DynError = Box<dyn Error + Send + Sync>;
+pub type ZgResult<T> = Result<T, DynError>;
+
 /// A normalized query prepared for simple matching and token inspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Query {
@@ -61,12 +72,33 @@ pub fn matches_query(query: &str, candidate: &str) -> bool {
     Query::new(query).matches(candidate)
 }
 
+pub fn other(message: impl Into<String>) -> DynError {
+    Box::new(MessageError(message.into()))
+}
+
 fn parse_terms(normalized: &str) -> Vec<String> {
     if normalized.is_empty() {
         return Vec::new();
     }
 
     normalized.split(' ').map(str::to_owned).collect()
+}
+
+#[derive(Debug)]
+struct MessageError(String);
+
+impl Display for MessageError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for MessageError {}
+
+impl From<io::Error> for MessageError {
+    fn from(value: io::Error) -> Self {
+        Self(value.to_string())
+    }
 }
 
 #[cfg(test)]

@@ -3,12 +3,19 @@ name = "zg"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Small query-normalization helpers for the zg search tooling."
+description = "Local-first filesystem query engine with regex and SQLite-backed search."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/zg"
-keywords = ["search", "query", "text", "normalize", "cli"]
-categories = ["text-processing", "command-line-utilities"]
+keywords = ["search", "query", "sqlite", "fts", "cli"]
+categories = ["filesystem", "text-processing", "command-line-utilities"]
 include = ["Cargo.toml", "README.md", "src/**/*.rs"]
 
 [dependencies]
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+regex = "1.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
