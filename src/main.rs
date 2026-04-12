@@ -5,7 +5,8 @@ use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
-use zg::index::{self, IndexStatus, RebuildStats};
+use zg::index::{self, IndexStatus};
+use zg::messages;
 use zg::search;
 use zg::{ZgResult, other};
 
@@ -78,7 +79,12 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error}");
+            let rendered = error.to_string();
+            if rendered.starts_with("zg:") {
+                eprintln!("{rendered}");
+            } else {
+                eprintln!("error: {rendered}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -129,13 +135,7 @@ fn run_index_command(command: IndexCommands) -> ZgResult<()> {
         IndexCommands::Init { path } => {
             let root = resolve_dir_arg(path.as_deref())?;
             let stats = index::init_index(&root)?;
-            println!(
-                "initialized {} (.zg/, SQLite, lazy-first index) [{} indexed / {} scanned / {} chunks]",
-                root.display(),
-                stats.indexed_files,
-                stats.scanned_files,
-                stats.chunks_indexed,
-            );
+            println!("{}", messages::initialized_index(&root, &stats));
             if let Some(note) = index::best_effort_overlap_note(&root)? {
                 println!("{note}");
             }
@@ -150,20 +150,15 @@ fn run_index_command(command: IndexCommands) -> ZgResult<()> {
         IndexCommands::Rebuild { path } => {
             let root = resolve_dir_arg(path.as_deref())?;
             let stats = index::rebuild_index(&root)?;
-            println!(
-                "rebuilt {} [{} indexed / {} scanned]",
-                root.display(),
-                stats.indexed_files,
-                stats.scanned_files
-            );
+            println!("{}", messages::rebuilt_index(&root, &stats));
             Ok(())
         }
         IndexCommands::Delete { path } => {
             let root = resolve_dir_arg(path.as_deref())?;
             if index::delete_index(&root)? {
-                println!("deleted local cache at {}", root.join(".zg").display());
+                println!("{}", messages::deleted_local_cache(&root));
             } else {
-                println!("no local cache at {}", root.join(".zg").display());
+                println!("{}", messages::no_local_cache(&root));
             }
             Ok(())
         }
@@ -185,8 +180,8 @@ fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
         SearchMode::Indexed => {
             let (root, init_stats) = index::ensure_index_root_for_search(&requested)?;
             if let Some(stats) = init_stats {
-                eprintln!("{}", format_implicit_init_note(&root, &stats));
-                eprintln!("{}", format_cache_delete_note(&root));
+                eprintln!("{}", messages::implicit_init_note(&root, &stats));
+                eprintln!("{}", messages::cache_delete_note(&root));
                 if let Some(note) = index::best_effort_overlap_note(&root)? {
                     eprintln!("{note}");
                 }
@@ -273,22 +268,6 @@ fn format_status(status: &IndexStatus) -> String {
     lines.join("\n") + "\n"
 }
 
-fn format_implicit_init_note(root: &Path, stats: &RebuildStats) -> String {
-    format!(
-        "note: no ancestor .zg index found; initialized local cache at {} for this search ({} files / {} chunks)",
-        root.display(),
-        stats.indexed_files,
-        stats.chunks_indexed,
-    )
-}
-
-fn format_cache_delete_note(root: &Path) -> String {
-    format!(
-        "note: this cache is optional; delete it later with `zg index delete \"{}\"`",
-        root.display()
-    )
-}
-
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -307,10 +286,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        Cli, Commands, IndexCommands, SearchMode, format_cache_delete_note,
-        format_implicit_init_note, format_status, parse_cli_from, resolve_search_mode,
+        Cli, Commands, IndexCommands, SearchMode, format_status, parse_cli_from,
+        resolve_search_mode,
     };
     use zg::index;
+    use zg::messages;
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -403,8 +383,8 @@ mod tests {
             chunks_indexed: 7,
         };
 
-        let init_note = format_implicit_init_note(&root, &stats);
-        let delete_note = format_cache_delete_note(&root);
+        let init_note = messages::implicit_init_note(&root, &stats);
+        let delete_note = messages::cache_delete_note(&root);
 
         assert!(init_note.contains("initialized local cache"));
         assert!(delete_note.contains("zg index delete"));

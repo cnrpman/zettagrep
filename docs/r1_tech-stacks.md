@@ -25,7 +25,7 @@ Date: 2026-04-12
 | `rusqlite` | `0.32.1` | `src/index/db.rs`、`src/index/sync.rs`、`src/index/hybrid.rs`，负责所有 SQLite 访问 | docs.rs 显示 `rusqlite` 最新线在 2026-03 仍有发布，仓库链接约 `4.1k` stars | 兼容性非常高。repo 的索引模型就是 SQLite-first，且 `bundled` feature 很适合这种自己控制 DB 文件的 CLI | 强烈保留。只是当前锁在较老 minor 线，后续可计划升级 |
 | `serde` | `1.0.228` | `src/index/types.rs` 里 `StateMirror` 序列化 | docs.rs 链接到 `serde-rs/serde` 约 `10.5k` stars；版本发布频率很高 | 兼容性非常高，且使用面很小很稳 | 强烈保留 |
 | `serde_json` | `1.0.149` | `src/index/db.rs`，负责写 `.zg/state.json` | docs.rs 链接到 `serde-rs/json` 约 `5.5k` stars；`1.0.149` 也是近几个月发布 | 兼容性非常高，当前只做轻量 JSON mirror，没有滥用 | 强烈保留 |
-| `sqlite-vec` | `0.1.9` | `src/index/db.rs`，负责注册 `sqlite3_vec_init`；`src/index/hybrid.rs` 围绕 `vec0` 查询设计语义检索 | `asg017/sqlite-vec` GitHub 约 `6.8k` stars；docs.rs 显示 2026-03 仍在活跃发版；README 明确声明它还是 pre-v1 | 兼容性高。你们已经把 schema、SQL 路径、scope filter 都围绕 `vec0` 设计，替换成本很高 | 保留，但必须把它视为“核心但有升级风险”的依赖 |
+| `sqlite-vec` | `0.1.9` | `src/index/db.rs`，负责注册 `sqlite3_vec_init`；`src/index/hybrid.rs` 围绕 `vec0` 查询设计语义检索 | `asg017/sqlite-vec` GitHub 约 `6.8k` stars；docs.rs 显示 2026-03 仍在活跃发版；README 明确声明它仍处于较早阶段 | 兼容性高。你们已经把 schema、SQL 路径、scope filter 都围绕 `vec0` 设计，替换成本很高 | 保留，但必须把它视为“核心但有升级风险”的依赖 |
 | `thiserror` | `2.0.18` | `src/lib.rs`，用于轻量自定义错误类型 | `thiserror` 是 Rust 里最常见的 error derive 之一 | 兼容性高。当前只拿它给 repo 自定义 message error 做 derive，侵入性很低 | 保留 |
 
 ## Summary Judgment
@@ -51,12 +51,12 @@ Date: 2026-04-12
 
 ## Compatibility Notes
 
-- 本地 `cargo test` 在 2026-04-12 通过，共 `46` 个测试全部通过。
+- 本地 `cargo test` 在 2026-04-12 通过，共 `56` 个测试全部通过。
 - `Cargo.toml` 里声明 `edition = "2024"`、`rust-version = "1.85"`，说明当前依赖组合至少对这个 repo 的工具链约束是可工作的。
 - 本地 `cargo run -- --help` 已确认新 CLI 入口可运行，help 输出保持 `zg <QUERY> [PATH]` / `zg <COMMAND>` 双入口模型。
 - 真正要持续关注的兼容性风险不是 `serde` / `rusqlite` 这种成熟库，而是:
   - `fastembed` 的大体积 transitive tree
-  - `sqlite-vec` 仍是 pre-v1
+- `sqlite-vec` 仍处于较早阶段
 
 ## Self-Written Modules That Could Be Replaced By Mainstream Deps
 
@@ -76,7 +76,7 @@ Date: 2026-04-12
   - 保留了轻量 message error，但改成 `thiserror` derive
 - `src/search/mod.rs`
   - 用 `regex-syntax` 替代了纯字符启发式判断
-  - 新增测试锁住 `C++`、`v1.2.3` 这类 plain text 不误判
+  - 新增测试锁住 `C++`、`1.2.3` 这类 plain text 不误判
 - `src/search/ripgrep_backend.rs`
   - 不再自己维护 ripgrep 搜索逻辑，改为调用 runtime `rg`
   - 运行时按 `ZG_RG_BIN` -> bundled `rg` -> `PATH` 顺序解析

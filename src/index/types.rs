@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_FILE_LINES: usize = 100_000;
 pub(crate) const DEFAULT_CHUNK_MODE: &str = "line";
 pub(crate) const DEFAULT_CHUNK_MARKER: &str = " :: ";
 pub(crate) const DEFAULT_SCOPE_POLICY: &str = "document suffix + encoding/character whitelist";
@@ -75,8 +76,7 @@ pub(crate) struct IndexedChunk {
     pub(crate) line_end: usize,
     pub(crate) raw_text: String,
     pub(crate) normalized_text: String,
-    pub(crate) text_hash: String,
-    pub(crate) vector: Vec<f32>,
+    pub(crate) normalized_text_hash: String,
 }
 
 #[derive(Clone, Debug)]

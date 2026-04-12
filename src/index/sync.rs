@@ -5,18 +5,37 @@ use std::path::{Path, PathBuf};
 use rusqlite::params;
 
 use crate::ZgResult;
+use crate::messages;
 use crate::paths;
 
 use super::db::{
-    create_schema, delete_by_rel_path, ensure_index_root, load_file_rows_for_scope,
-    load_state_mirror_status, mark_dirty, open_existing_db, open_or_create_db, seed_defaults,
-    set_dirty_state, status_for_index_root, upsert_document, validate_schema, write_state_mirror,
+    create_schema, delete_by_rel_path, ensure_index_root, gc_unreferenced_shared_chunks,
+    load_file_rows_for_scope, load_state_mirror_status, mark_dirty, open_existing_db,
+    open_or_create_db, seed_defaults, set_dirty_state, status_for_index_root, upsert_document,
+    validate_schema, write_state_mirror,
 };
-use super::files::{collect_candidate_files, collect_scope_candidates, load_indexable_document};
+use super::files::{
+    collect_candidate_files, collect_scope_candidates, load_indexable_document,
+    scan_candidate_files_until,
+};
 use super::types::{IndexStatus, RebuildStats, SyncStats};
 use super::util::{
     ancestor_index_root, descendant_index_root, modified_unix_ms, now_unix_ms, relative_path_string,
 };
+
+const IMPLICIT_INIT_MAX_FILES: usize = 2000;
+const IMPLICIT_INIT_MAX_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
+const PROTECTED_HOME_DIR_NAMES: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Music",
+    "Pictures",
+    "Public",
+    "Templates",
+    "Videos",
+    "Movies",
+];
 
 pub fn init_index(root: &Path) -> ZgResult<RebuildStats> {
     let root = paths::resolve_existing_dir(root)?;
@@ -61,6 +80,7 @@ pub fn ensure_index_root_for_search(scope: &Path) -> ZgResult<(PathBuf, Option<R
         })?
     };
 
+    ensure_safe_implicit_init_root(&root)?;
     let stats = init_index(&root)?;
     Ok((root, Some(stats)))
 }
@@ -76,11 +96,12 @@ pub fn rebuild_index(root: &Path) -> ZgResult<RebuildStats> {
     let started_at = now_unix_ms();
     let candidate_files = collect_candidate_files(&root)?;
     let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM fts_chunks", [])?;
+    tx.execute("DELETE FROM chunk_refs", [])?;
+    tx.execute("DELETE FROM files", [])?;
     tx.execute("DELETE FROM vec_index", [])?;
     tx.execute("DELETE FROM vec_chunks", [])?;
-    tx.execute("DELETE FROM fts_chunks", [])?;
-    tx.execute("DELETE FROM chunks", [])?;
-    tx.execute("DELETE FROM files", [])?;
+    tx.execute("DELETE FROM shared_chunks", [])?;
 
     let mut indexed_files = 0usize;
     let mut chunks_indexed = 0usize;
@@ -146,8 +167,16 @@ pub fn reconcile_covering_roots(scope: &Path) -> ZgResult<Option<PathBuf>> {
 
     for (index, root) in roots.iter().enumerate() {
         if let Err(error) = reconcile_scope_for_root(root, &scope) {
-            mark_dirty(root, &error.to_string())?;
+            let rendered = if messages::is_schema_version_mismatch(&error.to_string()) {
+                messages::schema_rebuild_dirty_reason(root)
+            } else {
+                error.to_string()
+            };
+            mark_dirty(root, &rendered)?;
             if index == 0 {
+                if messages::is_schema_version_mismatch(&error.to_string()) {
+                    return Err(crate::other(messages::schema_rebuild_required_error(root)));
+                }
                 return Err(error);
             }
         }
@@ -166,10 +195,15 @@ pub fn load_status(path: &Path) -> ZgResult<IndexStatus> {
                 Ok(status)
             }
             Err(error) => {
-                mark_dirty(&root, &error.to_string())?;
+                let dirty_reason = if messages::is_schema_version_mismatch(&error.to_string()) {
+                    messages::schema_rebuild_dirty_reason(&root)
+                } else {
+                    error.to_string()
+                };
+                mark_dirty(&root, &dirty_reason)?;
                 let mut status = load_state_mirror_status(&requested_path, Some(root.clone()));
                 status.dirty = true;
-                status.dirty_reason = Some(error.to_string());
+                status.dirty_reason = Some(dirty_reason);
                 Ok(status)
             }
         },
@@ -180,17 +214,11 @@ pub fn load_status(path: &Path) -> ZgResult<IndexStatus> {
 pub fn best_effort_overlap_note(root: &Path) -> ZgResult<Option<String>> {
     let root = paths::resolve_existing_dir(root)?;
     if let Some(ancestor) = ancestor_index_root(&root) {
-        return Ok(Some(format!(
-            "note: this directory is also covered by parent index {} ; adding a local index costs extra disk and duplicate updates, and under the current brute-force search path it is not a recall fix",
-            ancestor.display()
-        )));
+        return Ok(Some(messages::overlap_parent_note(&ancestor)));
     }
 
     if let Some(descendant) = descendant_index_root(&root)? {
-        return Ok(Some(format!(
-            "note: this directory already contains a nested index at {} ; overlapping indexes cost extra disk and duplicate updates, and under the current brute-force search path they are not needed for recall",
-            descendant.display()
-        )));
+        return Ok(Some(messages::overlap_child_note(&descendant)));
     }
 
     Ok(None)
@@ -248,6 +276,7 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
             delete_by_rel_path(&tx, rel_path)?;
         }
     }
+    gc_unreferenced_shared_chunks(&tx)?;
 
     set_dirty_state(
         &tx,
@@ -259,4 +288,95 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
 
     write_state_mirror(&root, &status_for_index_root(&root)?)?;
     Ok(stats)
+}
+
+fn ensure_safe_implicit_init_root(root: &Path) -> ZgResult<()> {
+    if let Some(reason) = protected_implicit_root_reason(root, home_dir()) {
+        return Err(crate::other(format_protected_root_refusal(root, reason)));
+    }
+
+    let summary =
+        scan_candidate_files_until(root, IMPLICIT_INIT_MAX_FILES, IMPLICIT_INIT_MAX_TOTAL_BYTES)?;
+    if summary.limit_tripped {
+        return Err(crate::other(format_threshold_refusal(
+            root,
+            summary.candidate_files,
+            summary.total_size_bytes,
+        )));
+    }
+
+    Ok(())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn protected_implicit_root_reason(root: &Path, home: Option<PathBuf>) -> Option<&'static str> {
+    if root == Path::new("/") {
+        return Some("filesystem root");
+    }
+
+    let home = home?;
+    if root == home {
+        return Some("home directory");
+    }
+    if PROTECTED_HOME_DIR_NAMES
+        .iter()
+        .map(|name| home.join(name))
+        .any(|dir| dir == root)
+    {
+        return Some("user content directory");
+    }
+
+    None
+}
+
+fn format_threshold_refusal(root: &Path, files: usize, total_size_bytes: u64) -> String {
+    messages::threshold_refusal(root, files, total_size_bytes)
+}
+
+fn format_protected_root_refusal(root: &Path, reason: &str) -> String {
+    messages::protected_root_refusal(root, reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{format_protected_root_refusal, protected_implicit_root_reason};
+    use crate::messages;
+
+    #[test]
+    fn protected_root_reason_matches_home_and_documents() {
+        let home = PathBuf::from("/tmp/zg-home");
+        assert_eq!(
+            protected_implicit_root_reason(&home, Some(home.clone())),
+            Some("home directory")
+        );
+        assert_eq!(
+            protected_implicit_root_reason(&home.join("Documents"), Some(home.clone())),
+            Some("user content directory")
+        );
+        assert_eq!(
+            protected_implicit_root_reason(&home.join("project"), Some(home)),
+            None
+        );
+    }
+
+    #[test]
+    fn protected_root_refusal_is_actionable() {
+        let root = PathBuf::from("/tmp/zg-home/Documents");
+        let rendered = format_protected_root_refusal(&root, "user content directory");
+        assert!(rendered.contains("zg: refusing to auto-create index"));
+        assert!(rendered.contains("zg index init"));
+        assert!(rendered.contains("user content directory"));
+    }
+
+    #[test]
+    fn schema_mismatch_messages_include_rebuild_instruction() {
+        let root = PathBuf::from("/tmp/zg-root");
+        assert!(messages::schema_rebuild_required_error(&root).contains("zg index rebuild"));
+        assert!(messages::schema_rebuild_dirty_reason(&root).contains("zg index rebuild"));
+    }
 }

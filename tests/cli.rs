@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::Connection;
+
 fn temp_dir(name: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -104,4 +106,47 @@ fn missing_path_returns_non_zero_exit_and_error_message() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("error: path does not exist:"));
     assert!(stderr.contains(&missing.display().to_string()));
+}
+
+#[test]
+fn implicit_init_large_scope_refusal_is_actionable() {
+    let root = temp_dir("implicit-guard");
+    for idx in 0..2000 {
+        fs::write(root.join(format!("note-{idx:04}.md")), "note").unwrap();
+    }
+
+    let output = zg().arg("plain search").arg(&root).output().unwrap();
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("zg: refusing to auto-create index"));
+    assert!(stderr.contains("2000 files"));
+    assert!(stderr.contains("zg index init"));
+    assert!(!stderr.contains("error:"));
+}
+
+#[test]
+fn schema_mismatch_search_failure_tells_user_to_rebuild() {
+    let root = temp_dir("schema-mismatch");
+    let file = root.join("note.md");
+    fs::write(&file, "hello world").unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let conn = Connection::open(root.join(".zg/index.db")).unwrap();
+    conn.execute(
+        "UPDATE settings SET value = '5' WHERE key = 'schema_version'",
+        [],
+    )
+    .unwrap();
+
+    let output = zg().arg("plain search").arg(&root).output().unwrap();
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("index schema/version mismatch"));
+    assert!(stderr.contains("zg index rebuild"));
+    assert!(stderr.starts_with("zg:"));
 }

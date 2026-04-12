@@ -60,10 +60,10 @@ fn lexical_candidates(
     match scope_kind(root, scope)? {
         ScopeKind::Root => {
             let mut stmt = conn.prepare(
-                "SELECT c.id, f.rel_path, c.raw_text, c.normalized_text, bm25(fts_chunks)
+                "SELECT cr.id, f.rel_path, cr.raw_text, cr.normalized_text, bm25(fts_chunks)
                  FROM fts_chunks
-                 JOIN chunks c ON c.id = fts_chunks.rowid
-                 JOIN files f ON f.id = c.file_id
+                 JOIN chunk_refs cr ON cr.id = fts_chunks.rowid
+                 JOIN files f ON f.id = cr.file_id
                  WHERE fts_chunks MATCH ?1
                  ORDER BY bm25(fts_chunks)
                  LIMIT ?2",
@@ -85,10 +85,10 @@ fn lexical_candidates(
         }
         ScopeKind::File(rel_path) => {
             let mut stmt = conn.prepare(
-                "SELECT c.id, f.rel_path, c.raw_text, c.normalized_text, bm25(fts_chunks)
+                "SELECT cr.id, f.rel_path, cr.raw_text, cr.normalized_text, bm25(fts_chunks)
                  FROM fts_chunks
-                 JOIN chunks c ON c.id = fts_chunks.rowid
-                 JOIN files f ON f.id = c.file_id
+                 JOIN chunk_refs cr ON cr.id = fts_chunks.rowid
+                 JOIN files f ON f.id = cr.file_id
                  WHERE fts_chunks MATCH ?1
                    AND f.rel_path = ?2
                  ORDER BY bm25(fts_chunks)
@@ -111,10 +111,10 @@ fn lexical_candidates(
         }
         ScopeKind::Directory(rel_path, prefix) => {
             let mut stmt = conn.prepare(
-                "SELECT c.id, f.rel_path, c.raw_text, c.normalized_text, bm25(fts_chunks)
+                "SELECT cr.id, f.rel_path, cr.raw_text, cr.normalized_text, bm25(fts_chunks)
                  FROM fts_chunks
-                 JOIN chunks c ON c.id = fts_chunks.rowid
-                 JOIN files f ON f.id = c.file_id
+                 JOIN chunk_refs cr ON cr.id = fts_chunks.rowid
+                 JOIN files f ON f.id = cr.file_id
                  WHERE fts_chunks MATCH ?1
                    AND (f.rel_path = ?2 OR f.rel_path LIKE ?3)
                  ORDER BY bm25(fts_chunks)
@@ -149,20 +149,20 @@ fn vector_candidates(
         ScopeKind::Root => {
             let mut stmt = conn.prepare(
                 "WITH knn_matches AS (
-                    SELECT chunk_id, distance
+                    SELECT shared_chunk_id, distance
                     FROM vec_index
                     WHERE embedding MATCH ?1
                       AND k = ?2
                 )
                 SELECT
-                    c.id,
+                    cr.id,
                     f.rel_path,
-                    c.raw_text,
+                    cr.raw_text,
                     km.distance
                 FROM knn_matches km
-                JOIN chunks c ON c.id = km.chunk_id
-                JOIN files f ON f.id = c.file_id
-                ORDER BY km.distance ASC, c.id ASC",
+                JOIN chunk_refs cr ON cr.shared_chunk_id = km.shared_chunk_id
+                JOIN files f ON f.id = cr.file_id
+                ORDER BY km.distance ASC, cr.id ASC",
             )?;
             collect_vector_rows(stmt.query_map(
                 params![query_blob, VECTOR_CANDIDATE_LIMIT as i64],
@@ -172,26 +172,27 @@ fn vector_candidates(
         ScopeKind::File(rel_path) => {
             let mut stmt = conn.prepare(
                 "WITH knn_matches AS (
-                    SELECT chunk_id, distance
+                    SELECT shared_chunk_id, distance
                     FROM vec_index
                     WHERE embedding MATCH ?1
                       AND k = ?2
-                      AND chunk_id IN (
-                          SELECT c.id
-                          FROM chunks c
-                          JOIN files f ON f.id = c.file_id
+                      AND shared_chunk_id IN (
+                          SELECT cr.shared_chunk_id
+                          FROM chunk_refs cr
+                          JOIN files f ON f.id = cr.file_id
                           WHERE f.rel_path = ?3
                       )
                 )
                 SELECT
-                    c.id,
+                    cr.id,
                     f.rel_path,
-                    c.raw_text,
+                    cr.raw_text,
                     km.distance
                 FROM knn_matches km
-                JOIN chunks c ON c.id = km.chunk_id
-                JOIN files f ON f.id = c.file_id
-                ORDER BY km.distance ASC, c.id ASC",
+                JOIN chunk_refs cr ON cr.shared_chunk_id = km.shared_chunk_id
+                JOIN files f ON f.id = cr.file_id
+                WHERE f.rel_path = ?3
+                ORDER BY km.distance ASC, cr.id ASC",
             )?;
             collect_vector_rows(stmt.query_map(
                 params![query_blob, VECTOR_CANDIDATE_LIMIT as i64, rel_path],
@@ -201,26 +202,27 @@ fn vector_candidates(
         ScopeKind::Directory(rel_path, prefix) => {
             let mut stmt = conn.prepare(
                 "WITH knn_matches AS (
-                    SELECT chunk_id, distance
+                    SELECT shared_chunk_id, distance
                     FROM vec_index
                     WHERE embedding MATCH ?1
                       AND k = ?2
-                      AND chunk_id IN (
-                          SELECT c.id
-                          FROM chunks c
-                          JOIN files f ON f.id = c.file_id
+                      AND shared_chunk_id IN (
+                          SELECT cr.shared_chunk_id
+                          FROM chunk_refs cr
+                          JOIN files f ON f.id = cr.file_id
                           WHERE f.rel_path = ?3 OR f.rel_path LIKE ?4
                       )
                 )
                 SELECT
-                    c.id,
+                    cr.id,
                     f.rel_path,
-                    c.raw_text,
+                    cr.raw_text,
                     km.distance
                 FROM knn_matches km
-                JOIN chunks c ON c.id = km.chunk_id
-                JOIN files f ON f.id = c.file_id
-                ORDER BY km.distance ASC, c.id ASC",
+                JOIN chunk_refs cr ON cr.shared_chunk_id = km.shared_chunk_id
+                JOIN files f ON f.id = cr.file_id
+                WHERE f.rel_path = ?3 OR f.rel_path LIKE ?4
+                ORDER BY km.distance ASC, cr.id ASC",
             )?;
             collect_vector_rows(stmt.query_map(
                 params![query_blob, VECTOR_CANDIDATE_LIMIT as i64, rel_path, prefix],

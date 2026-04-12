@@ -49,6 +49,36 @@ mod tests {
     }
 
     #[test]
+    fn repeated_normalized_text_across_files_shares_embedding_owner() {
+        let root = temp_dir("shared-owner");
+        fs::write(root.join("alpha.md"), "- Shared Note").unwrap();
+        fs::write(root.join("beta.md"), "# shared note").unwrap();
+
+        init_index(&root).unwrap();
+
+        let conn = super::db::open_existing_db(&root).unwrap();
+        let shared_count = conn
+            .query_row("SELECT COUNT(*) FROM shared_chunks", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let ref_count = conn
+            .query_row("SELECT COUNT(*) FROM chunk_refs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let vec_count = conn
+            .query_row("SELECT COUNT(*) FROM vec_index", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        assert_eq!(shared_count, 1);
+        assert_eq!(ref_count, 2);
+        assert_eq!(vec_count, 1);
+    }
+
+    #[test]
     fn reconcile_refreshes_modified_scope_on_search_path() {
         let root = temp_dir("reconcile");
         let nested = root.join("notes");
@@ -64,6 +94,38 @@ mod tests {
         let hits = search_hybrid(&root, &nested, "sqlite recall", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rel_path, "notes/alpha.md");
+    }
+
+    #[test]
+    fn deleting_last_reference_gcs_shared_embedding() {
+        let root = temp_dir("gc-shared");
+        let file = root.join("alpha.md");
+        fs::write(&file, "shared note").unwrap();
+        init_index(&root).unwrap();
+
+        fs::remove_file(&file).unwrap();
+        reconcile_covering_roots(&root).unwrap();
+
+        let conn = super::db::open_existing_db(&root).unwrap();
+        let shared_count = conn
+            .query_row("SELECT COUNT(*) FROM shared_chunks", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let vec_count = conn
+            .query_row("SELECT COUNT(*) FROM vec_index", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let ref_count = conn
+            .query_row("SELECT COUNT(*) FROM chunk_refs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        assert_eq!(shared_count, 0);
+        assert_eq!(vec_count, 0);
+        assert_eq!(ref_count, 0);
     }
 
     #[test]
@@ -226,5 +288,19 @@ mod tests {
         let status = load_status(&root).unwrap();
         assert!(status.indexed);
         assert!(status.vector_ready);
+    }
+
+    #[test]
+    fn implicit_init_refuses_large_document_tree() {
+        let root = temp_dir("implicit-guard-threshold");
+        for idx in 0..2000 {
+            fs::write(root.join(format!("note-{idx:04}.md")), "note").unwrap();
+        }
+
+        let error = ensure_index_root_for_search(&root).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("zg: refusing to auto-create index"));
+        assert!(message.contains("2000 files"));
+        assert!(!root.join(".zg/index.db").exists());
     }
 }

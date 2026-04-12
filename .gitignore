@@ -2,3 +2,4 @@
 Cargo.lock
 .omx/
 .doc/
+/.fastembed_cache/
