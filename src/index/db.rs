@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use rusqlite::auto_extension::{RawAutoExtension, register_auto_extension};
 use rusqlite::{Connection, OptionalExtension, params};
+use sqlite_vec::sqlite3_vec_init;
 
 use crate::paths;
 use crate::walk::DEFAULT_WALK_POLICY;
@@ -11,10 +14,14 @@ use crate::{ZgResult, other};
 use super::types::{
     DEFAULT_CHUNK_MARKER, DEFAULT_CHUNK_MODE, DEFAULT_SCOPE_POLICY, DEFAULT_VECTOR_PROVIDER,
     FileRecord, IndexStatus, IndexedDocument, SCHEMA_VERSION, ScopeKind, StateMirror, StateRow,
+    VECTOR_DIMENSIONS,
 };
 use super::util::{now_unix_ms, scope_kind};
 
+static SQLITE_VEC_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+
 pub(crate) fn open_or_create_db(root: &Path) -> ZgResult<Connection> {
+    ensure_sqlite_vec_registered()?;
     let db_path = paths::db_path(root);
     let conn = Connection::open(db_path)?;
     conn.execute_batch(
@@ -23,6 +30,18 @@ pub(crate) fn open_or_create_db(root: &Path) -> ZgResult<Connection> {
          PRAGMA synchronous = NORMAL;",
     )?;
     Ok(conn)
+}
+
+fn ensure_sqlite_vec_registered() -> ZgResult<()> {
+    SQLITE_VEC_REGISTERED
+        .get_or_init(|| unsafe {
+            let sqlite_vec_init: RawAutoExtension =
+                std::mem::transmute::<*const (), RawAutoExtension>(sqlite3_vec_init as *const ());
+            register_auto_extension(sqlite_vec_init)
+                .map_err(|error| format!("failed to register sqlite-vec auto extension: {error}"))
+        })
+        .clone()
+        .map_err(crate::other)
 }
 
 pub(crate) fn open_existing_db(root: &Path) -> ZgResult<Connection> {
@@ -46,7 +65,7 @@ pub(crate) fn ensure_index_root(root: &Path) -> ZgResult<()> {
 }
 
 pub(crate) fn create_schema(conn: &Connection) -> ZgResult<()> {
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -86,6 +105,11 @@ pub(crate) fn create_schema(conn: &Connection) -> ZgResult<()> {
             provider TEXT NOT NULL,
             dims INTEGER NOT NULL,
             vector BLOB NOT NULL
+                CHECK(typeof(vector) = 'blob' AND vec_length(vector) = dims)
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{VECTOR_DIMENSIONS}] distance_metric=cosine
         );
         CREATE TABLE IF NOT EXISTS index_runs (
             id INTEGER PRIMARY KEY,
@@ -97,7 +121,7 @@ pub(crate) fn create_schema(conn: &Connection) -> ZgResult<()> {
             chunks_indexed INTEGER NOT NULL,
             error TEXT
         );",
-    )?;
+    ))?;
     Ok(())
 }
 
@@ -109,6 +133,7 @@ pub(crate) fn validate_schema(conn: &Connection) -> ZgResult<()> {
         "chunks",
         "fts_chunks",
         "vec_chunks",
+        "vec_index",
         "index_runs",
     ];
     for table in required {
@@ -312,9 +337,13 @@ pub(crate) fn upsert_document(
             params![
                 chunk_id,
                 DEFAULT_VECTOR_PROVIDER,
-                super::types::VECTOR_DIMENSIONS as i64,
+                chunk.vector.len() as i64,
                 super::hybrid::encode_vector(&chunk.vector)
             ],
+        )?;
+        conn.execute(
+            "INSERT INTO vec_index (chunk_id, embedding) VALUES (?1, ?2)",
+            params![chunk_id, super::hybrid::encode_vector(&chunk.vector)],
         )?;
     }
 
@@ -341,6 +370,7 @@ pub(crate) fn delete_by_rel_path(conn: &Connection, rel_path: &str) -> ZgResult<
 
     for chunk_id in chunk_ids {
         conn.execute("DELETE FROM fts_chunks WHERE rowid = ?1", [chunk_id])?;
+        conn.execute("DELETE FROM vec_index WHERE chunk_id = ?1", [chunk_id])?;
         conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [chunk_id])?;
     }
     conn.execute("DELETE FROM chunks WHERE file_id = ?1", [file_id])?;
@@ -402,7 +432,11 @@ pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
     let vector_ready = conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| {
         row.get::<_, i64>(0)
     })? as u64
-        == chunk_count;
+        == chunk_count
+        && conn.query_row("SELECT COUNT(*) FROM vec_index", [], |row| {
+            row.get::<_, i64>(0)
+        })? as u64
+            == chunk_count;
     let state = load_state(&conn)?.unwrap_or(StateRow {
         dirty: false,
         dirty_reason: None,

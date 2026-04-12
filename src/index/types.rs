@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_CHUNK_MODE: &str = "line";
 pub(crate) const DEFAULT_CHUNK_MARKER: &str = " :: ";
 pub(crate) const DEFAULT_SCOPE_POLICY: &str = "suffix + encoding/character whitelist";
-pub(crate) const DEFAULT_VECTOR_PROVIDER: &str = "local-hash-v1";
+pub(crate) const DEFAULT_VECTOR_PROVIDER: &str = "fastembed-bge-small-en-v1.5";
 
-pub(crate) const VECTOR_DIMENSIONS: usize = 64;
+pub(crate) const VECTOR_DIMENSIONS: usize = 384;
 pub(crate) const FTS_CANDIDATE_LIMIT: usize = 96;
 pub(crate) const VECTOR_CANDIDATE_LIMIT: usize = 96;
 pub(crate) const RRF_K: f64 = 20.0;

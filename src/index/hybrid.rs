@@ -144,52 +144,95 @@ fn vector_candidates(
     scope: &Path,
     query_vector: &[f32],
 ) -> ZgResult<Vec<StoredChunk>> {
-    let mut out = match scope_kind(root, scope)? {
+    let query_blob = encode_vector(query_vector);
+    let rows = match scope_kind(root, scope)? {
         ScopeKind::Root => {
             let mut stmt = conn.prepare(
-                "SELECT c.id, f.rel_path, c.raw_text, v.vector
-                 FROM chunks c
-                 JOIN files f ON f.id = c.file_id
-                 JOIN vec_chunks v ON v.chunk_id = c.id",
+                "WITH knn_matches AS (
+                    SELECT chunk_id, distance
+                    FROM vec_index
+                    WHERE embedding MATCH ?1
+                      AND k = ?2
+                )
+                SELECT
+                    c.id,
+                    f.rel_path,
+                    c.raw_text,
+                    km.distance
+                FROM knn_matches km
+                JOIN chunks c ON c.id = km.chunk_id
+                JOIN files f ON f.id = c.file_id
+                ORDER BY km.distance ASC, c.id ASC",
             )?;
-            stmt.query_map([], |row| vector_row(row, query_vector))?
-                .collect::<Result<Vec<_>, _>>()?
+            collect_vector_rows(stmt.query_map(
+                params![query_blob, VECTOR_CANDIDATE_LIMIT as i64],
+                vector_row_from_distance,
+            )?)
         }
         ScopeKind::File(rel_path) => {
             let mut stmt = conn.prepare(
-                "SELECT c.id, f.rel_path, c.raw_text, v.vector
-                 FROM chunks c
-                 JOIN files f ON f.id = c.file_id
-                 JOIN vec_chunks v ON v.chunk_id = c.id
-                 WHERE f.rel_path = ?1",
+                "WITH knn_matches AS (
+                    SELECT chunk_id, distance
+                    FROM vec_index
+                    WHERE embedding MATCH ?1
+                      AND k = ?2
+                      AND chunk_id IN (
+                          SELECT c.id
+                          FROM chunks c
+                          JOIN files f ON f.id = c.file_id
+                          WHERE f.rel_path = ?3
+                      )
+                )
+                SELECT
+                    c.id,
+                    f.rel_path,
+                    c.raw_text,
+                    km.distance
+                FROM knn_matches km
+                JOIN chunks c ON c.id = km.chunk_id
+                JOIN files f ON f.id = c.file_id
+                ORDER BY km.distance ASC, c.id ASC",
             )?;
-            stmt.query_map([rel_path], |row| vector_row(row, query_vector))?
-                .collect::<Result<Vec<_>, _>>()?
+            collect_vector_rows(stmt.query_map(
+                params![query_blob, VECTOR_CANDIDATE_LIMIT as i64, rel_path],
+                vector_row_from_distance,
+            )?)
         }
         ScopeKind::Directory(rel_path, prefix) => {
             let mut stmt = conn.prepare(
-                "SELECT c.id, f.rel_path, c.raw_text, v.vector
-                 FROM chunks c
-                 JOIN files f ON f.id = c.file_id
-                 JOIN vec_chunks v ON v.chunk_id = c.id
-                 WHERE f.rel_path = ?1 OR f.rel_path LIKE ?2",
+                "WITH knn_matches AS (
+                    SELECT chunk_id, distance
+                    FROM vec_index
+                    WHERE embedding MATCH ?1
+                      AND k = ?2
+                      AND chunk_id IN (
+                          SELECT c.id
+                          FROM chunks c
+                          JOIN files f ON f.id = c.file_id
+                          WHERE f.rel_path = ?3 OR f.rel_path LIKE ?4
+                      )
+                )
+                SELECT
+                    c.id,
+                    f.rel_path,
+                    c.raw_text,
+                    km.distance
+                FROM knn_matches km
+                JOIN chunks c ON c.id = km.chunk_id
+                JOIN files f ON f.id = c.file_id
+                ORDER BY km.distance ASC, c.id ASC",
             )?;
-            stmt.query_map(params![rel_path, prefix], |row| {
-                vector_row(row, query_vector)
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+            collect_vector_rows(stmt.query_map(
+                params![query_blob, VECTOR_CANDIDATE_LIMIT as i64, rel_path, prefix],
+                vector_row_from_distance,
+            )?)
         }
-    };
+    }?;
 
-    out.sort_by(|left, right| {
-        right
-            .vector_score
-            .partial_cmp(&left.vector_score)
-            .unwrap_or(Ordering::Equal)
-    });
-    out.retain(|row| row.vector_score > 0.0);
-    out.truncate(VECTOR_CANDIDATE_LIMIT);
-    Ok(out)
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.vector_score > 0.0)
+        .collect())
 }
 
 fn merge_ranked_hits(
@@ -270,20 +313,6 @@ fn lexical_score(text: &str, query: &Query, bm25: f64) -> f64 {
     coverage + (-bm25).max(0.0)
 }
 
-fn decode_vector(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])))
-        .collect()
-}
-
-fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(l, r)| f64::from(*l) * f64::from(*r))
-        .sum::<f64>()
-}
-
 fn collect_lexical_rows(
     rows: impl Iterator<Item = rusqlite::Result<StoredChunk>>,
 ) -> ZgResult<Vec<StoredChunk>> {
@@ -294,15 +323,24 @@ fn collect_lexical_rows(
     Ok(out)
 }
 
-fn vector_row(row: &rusqlite::Row<'_>, query_vector: &[f32]) -> rusqlite::Result<StoredChunk> {
-    let blob: Vec<u8> = row.get(3)?;
-    let vector = decode_vector(&blob);
+fn collect_vector_rows(
+    rows: impl Iterator<Item = rusqlite::Result<StoredChunk>>,
+) -> ZgResult<Vec<StoredChunk>> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn vector_row_from_distance(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChunk> {
+    let distance: f64 = row.get(3)?;
     Ok(StoredChunk {
         chunk_id: row.get(0)?,
         rel_path: row.get(1)?,
         raw_text: row.get(2)?,
         lexical_score: 0.0,
-        vector_score: cosine_similarity(&vector, query_vector),
+        vector_score: 1.0 - distance,
     })
 }
 

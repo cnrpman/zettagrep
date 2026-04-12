@@ -30,6 +30,23 @@ pub fn init_index(root: &Path) -> ZgResult<RebuildStats> {
     rebuild_index(&root)
 }
 
+pub fn delete_index(root: &Path) -> ZgResult<bool> {
+    let root = paths::resolve_existing_dir(root)?;
+    let hidden = paths::hidden_dir(&root);
+    if !hidden.exists() {
+        return Ok(false);
+    }
+    if !fs::metadata(&hidden)?.is_dir() {
+        return Err(crate::other(format!(
+            "expected cache directory at {}",
+            hidden.display()
+        )));
+    }
+
+    fs::remove_dir_all(hidden)?;
+    Ok(true)
+}
+
 pub fn ensure_index_root_for_search(scope: &Path) -> ZgResult<(PathBuf, Option<RebuildStats>)> {
     let scope = paths::resolve_existing_path(scope)?;
     if let Some(root) = paths::find_index_root(&scope) {
@@ -59,6 +76,7 @@ pub fn rebuild_index(root: &Path) -> ZgResult<RebuildStats> {
     let started_at = now_unix_ms();
     let candidate_files = collect_candidate_files(&root)?;
     let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM vec_index", [])?;
     tx.execute("DELETE FROM vec_chunks", [])?;
     tx.execute("DELETE FROM fts_chunks", [])?;
     tx.execute("DELETE FROM chunks", [])?;
@@ -163,14 +181,14 @@ pub fn best_effort_overlap_note(root: &Path) -> ZgResult<Option<String>> {
     let root = paths::resolve_existing_dir(root)?;
     if let Some(ancestor) = ancestor_index_root(&root) {
         return Ok(Some(format!(
-            "note: this directory is also covered by parent index {} ; adding a local index trades disk and slower updates for tighter local recall",
+            "note: this directory is also covered by parent index {} ; adding a local index costs extra disk and duplicate updates, and under the current brute-force search path it is not a recall fix",
             ancestor.display()
         )));
     }
 
     if let Some(descendant) = descendant_index_root(&root)? {
         return Ok(Some(format!(
-            "note: this directory already contains a nested index at {} ; overlapping indexes cost extra disk and slower updates",
+            "note: this directory already contains a nested index at {} ; overlapping indexes cost extra disk and duplicate updates, and under the current brute-force search path they are not needed for recall",
             descendant.display()
         )));
     }

@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use zg::index::{self, IndexStatus};
+use zg::index::{self, IndexStatus, RebuildStats};
 use zg::search;
 use zg::{ZgResult, other};
 
@@ -57,7 +57,7 @@ fn run() -> ZgResult<()> {
 fn run_index_command(args: &[String]) -> ZgResult<()> {
     let Some(command) = args.first().map(String::as_str) else {
         return Err(other(
-            "missing index subcommand: expected init|status|rebuild",
+            "missing index subcommand: expected init|status|rebuild|delete",
         ));
     };
 
@@ -94,6 +94,15 @@ fn run_index_command(args: &[String]) -> ZgResult<()> {
             );
             Ok(())
         }
+        "delete" => {
+            let root = resolve_dir_arg(args.get(1).map(String::as_str))?;
+            if index::delete_index(&root)? {
+                println!("deleted local cache at {}", root.join(".zg").display());
+            } else {
+                println!("no local cache at {}", root.join(".zg").display());
+            }
+            Ok(())
+        }
         command => Err(other(format!("unknown index subcommand: {command}"))),
     }
 }
@@ -113,12 +122,8 @@ fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
         SearchMode::Indexed => {
             let (root, init_stats) = index::ensure_index_root_for_search(&requested)?;
             if let Some(stats) = init_stats {
-                eprintln!(
-                    "note: no ancestor .zg index found; initializing local index at {} for this search ({} files / {} chunks)",
-                    root.display(),
-                    stats.indexed_files,
-                    stats.chunks_indexed,
-                );
+                eprintln!("{}", format_implicit_init_note(&root, &stats));
+                eprintln!("{}", format_cache_delete_note(&root));
                 if let Some(note) = index::best_effort_overlap_note(&root)? {
                     eprintln!("{note}");
                 }
@@ -214,6 +219,22 @@ fn format_status(status: &IndexStatus) -> String {
     lines.join("\n") + "\n"
 }
 
+fn format_implicit_init_note(root: &Path, stats: &RebuildStats) -> String {
+    format!(
+        "note: no ancestor .zg index found; initialized local cache at {} for this search ({} files / {} chunks)",
+        root.display(),
+        stats.indexed_files,
+        stats.chunks_indexed,
+    )
+}
+
+fn format_cache_delete_note(root: &Path) -> String {
+    format!(
+        "note: this cache is optional; delete it later with `zg index delete \"{}\"`",
+        root.display()
+    )
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -225,6 +246,7 @@ fn print_help() {
     println!("zg index init [path]");
     println!("zg index status [path]");
     println!("zg index rebuild [path]");
+    println!("zg index delete [path]");
 }
 
 #[cfg(test)]
@@ -233,7 +255,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{SearchMode, format_status, resolve_search_mode};
+    use super::{
+        SearchMode, format_cache_delete_note, format_implicit_init_note, format_status,
+        resolve_search_mode,
+    };
     use zg::index;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -290,5 +315,22 @@ mod tests {
         assert!(rendered.contains("walk policy: ripgrep-style:"));
         assert!(rendered.contains(".zgignore"));
         assert!(rendered.contains(".zg/ always skipped"));
+    }
+
+    #[test]
+    fn implicit_init_note_mentions_delete_command() {
+        let root = temp_dir("implicit-note");
+        let stats = index::RebuildStats {
+            scanned_files: 3,
+            indexed_files: 2,
+            chunks_indexed: 7,
+        };
+
+        let init_note = format_implicit_init_note(&root, &stats);
+        let delete_note = format_cache_delete_note(&root);
+
+        assert!(init_note.contains("initialized local cache"));
+        assert!(delete_note.contains("zg index delete"));
+        assert!(delete_note.contains(&root.display().to_string()));
     }
 }
