@@ -57,12 +57,7 @@ pub(crate) fn descendant_index_root(root: &Path) -> ZgResult<Option<PathBuf>> {
 }
 
 pub(crate) fn stable_hash(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 pub(crate) fn now_unix_ms() -> u64 {
@@ -94,4 +89,17 @@ pub(crate) fn scope_kind(root: &Path, scope: &Path) -> ZgResult<ScopeKind> {
         rel_path.clone(),
         format!("{rel_path}/%"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stable_hash;
+
+    #[test]
+    fn stable_hash_matches_blake3_hex_output() {
+        assert_eq!(
+            stable_hash(b"zg stable hash"),
+            "8676862cc6fe8089fe2fda020dd635fceb3b06b8e0e0f45761c9047c6ac8724c"
+        );
+    }
 }

@@ -1,14 +1,13 @@
-use std::error::Error;
-use std::fmt::{self, Display, Formatter};
-use std::io;
+use anyhow::Error;
+use thiserror::Error;
 
 pub mod index;
 pub mod paths;
 pub mod search;
 mod walk;
 
-pub type DynError = Box<dyn Error + Send + Sync>;
-pub type ZgResult<T> = Result<T, DynError>;
+pub type DynError = Error;
+pub type ZgResult<T> = anyhow::Result<T>;
 
 /// A normalized query prepared for simple matching and token inspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,7 +73,7 @@ pub fn matches_query(query: &str, candidate: &str) -> bool {
 }
 
 pub fn other(message: impl Into<String>) -> DynError {
-    Box::new(MessageError(message.into()))
+    MessageError(message.into()).into()
 }
 
 fn parse_terms(normalized: &str) -> Vec<String> {
@@ -85,22 +84,9 @@ fn parse_terms(normalized: &str) -> Vec<String> {
     normalized.split(' ').map(str::to_owned).collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{0}")]
 struct MessageError(String);
-
-impl Display for MessageError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Error for MessageError {}
-
-impl From<io::Error> for MessageError {
-    fn from(value: io::Error) -> Self {
-        Self(value.to_string())
-    }
-}
 
 #[cfg(test)]
 mod tests {

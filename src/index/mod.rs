@@ -208,4 +208,23 @@ mod tests {
         assert!(!status.vector_ready);
         assert!(status.fts_ready);
     }
+
+    #[test]
+    fn rebuild_refreshes_schema_version_after_hash_upgrade() {
+        let root = temp_dir("schema-upgrade");
+        fs::write(root.join("alpha.md"), "sqlite :: vector adapter").unwrap();
+        init_index(&root).unwrap();
+
+        let conn = super::db::open_existing_db(&root).unwrap();
+        conn.execute(
+            "UPDATE settings SET value = '4' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+
+        rebuild_index(&root).unwrap();
+        let status = load_status(&root).unwrap();
+        assert!(status.indexed);
+        assert!(status.vector_ready);
+    }
 }

@@ -168,7 +168,8 @@ pub(crate) fn seed_defaults(conn: &Connection) -> ZgResult<()> {
 
     for (key, value) in settings {
         conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
     }

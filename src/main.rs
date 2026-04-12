@@ -1,7 +1,10 @@
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand};
 use zg::index::{self, IndexStatus, RebuildStats};
 use zg::search;
 use zg::{ZgResult, other};
@@ -10,6 +13,65 @@ use zg::{ZgResult, other};
 enum SearchMode {
     Regex,
     Indexed,
+}
+
+#[derive(Debug, Parser, PartialEq)]
+#[command(
+    name = "zg",
+    disable_help_subcommand = true,
+    disable_version_flag = true,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[arg(value_name = "QUERY", required = true, allow_hyphen_values = true)]
+    query: Option<String>,
+
+    #[arg(value_name = "PATH", allow_hyphen_values = true)]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand, PartialEq)]
+enum Commands {
+    Grep {
+        #[arg(value_name = "PATTERN", allow_hyphen_values = true)]
+        pattern: String,
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
+        path: Option<PathBuf>,
+    },
+    Search {
+        #[arg(value_name = "QUERY", allow_hyphen_values = true)]
+        query: String,
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
+        path: Option<PathBuf>,
+    },
+    Index {
+        #[command(subcommand)]
+        command: IndexCommands,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq)]
+enum IndexCommands {
+    Init {
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
+        path: Option<PathBuf>,
+    },
+    Status {
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
+        path: Option<PathBuf>,
+    },
+    Rebuild {
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
+        path: Option<PathBuf>,
+    },
+    Delete {
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
+        path: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -23,47 +85,49 @@ fn main() -> ExitCode {
 }
 
 fn run() -> ZgResult<()> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() {
-        print_help();
+    let args = env::args_os().collect::<Vec<_>>();
+    if args.len() == 1 {
+        print_help()?;
         return Ok(());
     }
 
-    match args[0].as_str() {
-        "-h" | "--help" => {
-            print_help();
+    match parse_cli_from(args) {
+        Ok(cli) => run_cli(cli),
+        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp) => {
+            print!("{error}");
             Ok(())
         }
-        "grep" => {
-            let (pattern, path) = parse_query_and_path(&args[1..])?;
-            run_grep(&pattern, path.as_deref())
-        }
-        "search" => {
-            let (query, path) = parse_query_and_path(&args[1..])?;
-            run_search(&query, path.as_deref())
-        }
-        "index" => run_index_command(&args[1..]),
-        query => {
-            let path = args.get(1).map(PathBuf::from);
-            if search::is_probably_regex(query) {
-                run_grep(query, path.as_deref())
-            } else {
-                run_search(query, path.as_deref())
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn parse_cli_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    Cli::try_parse_from(args)
+}
+
+fn run_cli(cli: Cli) -> ZgResult<()> {
+    match cli.command {
+        Some(Commands::Grep { pattern, path }) => run_grep(&pattern, path.as_deref()),
+        Some(Commands::Search { query, path }) => run_search(&query, path.as_deref()),
+        Some(Commands::Index { command }) => run_index_command(command),
+        None => {
+            let query = cli.query.ok_or_else(|| other("missing query"))?;
+            match resolve_search_mode(&query) {
+                SearchMode::Regex => run_grep(&query, cli.path.as_deref()),
+                SearchMode::Indexed => run_search(&query, cli.path.as_deref()),
             }
         }
     }
 }
 
-fn run_index_command(args: &[String]) -> ZgResult<()> {
-    let Some(command) = args.first().map(String::as_str) else {
-        return Err(other(
-            "missing index subcommand: expected init|status|rebuild|delete",
-        ));
-    };
-
+fn run_index_command(command: IndexCommands) -> ZgResult<()> {
     match command {
-        "init" => {
-            let root = resolve_dir_arg(args.get(1).map(String::as_str))?;
+        IndexCommands::Init { path } => {
+            let root = resolve_dir_arg(path.as_deref())?;
             let stats = index::init_index(&root)?;
             println!(
                 "initialized {} (.zg/, SQLite, lazy-first index) [{} indexed / {} scanned / {} chunks]",
@@ -77,14 +141,14 @@ fn run_index_command(args: &[String]) -> ZgResult<()> {
             }
             Ok(())
         }
-        "status" => {
-            let target = resolve_path_arg(args.get(1).map(String::as_str))?;
+        IndexCommands::Status { path } => {
+            let target = resolve_path_arg(path.as_deref())?;
             let status = index::load_status(&target)?;
             print_status(&status);
             Ok(())
         }
-        "rebuild" => {
-            let root = resolve_dir_arg(args.get(1).map(String::as_str))?;
+        IndexCommands::Rebuild { path } => {
+            let root = resolve_dir_arg(path.as_deref())?;
             let stats = index::rebuild_index(&root)?;
             println!(
                 "rebuilt {} [{} indexed / {} scanned]",
@@ -94,8 +158,8 @@ fn run_index_command(args: &[String]) -> ZgResult<()> {
             );
             Ok(())
         }
-        "delete" => {
-            let root = resolve_dir_arg(args.get(1).map(String::as_str))?;
+        IndexCommands::Delete { path } => {
+            let root = resolve_dir_arg(path.as_deref())?;
             if index::delete_index(&root)? {
                 println!("deleted local cache at {}", root.join(".zg").display());
             } else {
@@ -103,12 +167,11 @@ fn run_index_command(args: &[String]) -> ZgResult<()> {
             }
             Ok(())
         }
-        command => Err(other(format!("unknown index subcommand: {command}"))),
     }
 }
 
 fn run_grep(pattern: &str, path: Option<&Path>) -> ZgResult<()> {
-    let root = resolve_path_arg(path.and_then(|value| value.to_str()))?;
+    let root = resolve_path_arg(path)?;
     for hit in search::regex_search(pattern, &root)? {
         println!("{}:{}:{}", hit.path.display(), hit.line_number, hit.line);
     }
@@ -116,8 +179,8 @@ fn run_grep(pattern: &str, path: Option<&Path>) -> ZgResult<()> {
 }
 
 fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
-    let requested = resolve_path_arg(path.and_then(|value| value.to_str()))?;
-    match resolve_search_mode(query, &requested) {
+    let requested = resolve_path_arg(path)?;
+    match resolve_search_mode(query) {
         SearchMode::Regex => run_grep(query, Some(&requested)),
         SearchMode::Indexed => {
             let (root, init_stats) = index::ensure_index_root_for_search(&requested)?;
@@ -141,37 +204,28 @@ fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
     }
 }
 
-fn resolve_search_mode(query: &str, requested: &Path) -> SearchMode {
+fn resolve_search_mode(query: &str) -> SearchMode {
     if search::is_probably_regex(query) {
         return SearchMode::Regex;
     }
 
-    let _ = requested;
     SearchMode::Indexed
 }
 
-fn resolve_dir_arg(path: Option<&str>) -> ZgResult<PathBuf> {
+fn resolve_dir_arg(path: Option<&Path>) -> ZgResult<PathBuf> {
     let candidate = match path {
-        Some(value) => PathBuf::from(value),
+        Some(value) => value.to_path_buf(),
         None => env::current_dir()?,
     };
     zg::paths::resolve_existing_dir(&candidate)
 }
 
-fn resolve_path_arg(path: Option<&str>) -> ZgResult<PathBuf> {
+fn resolve_path_arg(path: Option<&Path>) -> ZgResult<PathBuf> {
     let candidate = match path {
-        Some(value) => PathBuf::from(value),
+        Some(value) => value.to_path_buf(),
         None => env::current_dir()?,
     };
     zg::paths::resolve_existing_path(&candidate)
-}
-
-fn parse_query_and_path(args: &[String]) -> ZgResult<(String, Option<PathBuf>)> {
-    let Some(query) = args.first() else {
-        return Err(other("missing query"));
-    };
-
-    Ok((query.clone(), args.get(1).map(PathBuf::from)))
 }
 
 fn print_status(status: &IndexStatus) {
@@ -239,14 +293,11 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-fn print_help() {
-    println!("zg <pattern-or-query> [path]");
-    println!("zg grep <pattern> [path]");
-    println!("zg search <query> [path]");
-    println!("zg index init [path]");
-    println!("zg index status [path]");
-    println!("zg index rebuild [path]");
-    println!("zg index delete [path]");
+fn print_help() -> ZgResult<()> {
+    let mut command = Cli::command();
+    command.print_help()?;
+    println!();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -256,8 +307,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        SearchMode, format_cache_delete_note, format_implicit_init_note, format_status,
-        resolve_search_mode,
+        Cli, Commands, IndexCommands, SearchMode, format_cache_delete_note,
+        format_implicit_init_note, format_status, parse_cli_from, resolve_search_mode,
     };
     use zg::index;
 
@@ -281,7 +332,7 @@ mod tests {
         let root = temp_dir("regex-mode");
         mark_indexed(&root);
 
-        let mode = resolve_search_mode(r"TODO|FIXME", &root);
+        let mode = resolve_search_mode(r"TODO|FIXME");
         assert_eq!(mode, SearchMode::Regex);
     }
 
@@ -290,7 +341,7 @@ mod tests {
         let root = temp_dir("fts-mode");
         mark_indexed(&root);
 
-        let mode = resolve_search_mode("sqlite vector", &root);
+        let mode = resolve_search_mode("sqlite vector");
         assert_eq!(mode, SearchMode::Indexed);
     }
 
@@ -302,8 +353,34 @@ mod tests {
         // CLI dispatch is intentionally simple: non-regex input enters the indexed-search
         // pipeline, which then reuses the nearest ancestor .zg or creates one for the
         // directory search scope before reconcile/embed work runs.
-        let mode = resolve_search_mode("sqlite vector", &root);
+        let mode = resolve_search_mode("sqlite vector");
         assert_eq!(mode, SearchMode::Indexed);
+    }
+
+    #[test]
+    fn default_entrypoint_parses_query_and_path() {
+        let cli = parse_cli_from(["zg", "sqlite vector", "docs"]).unwrap();
+        assert_eq!(
+            cli,
+            Cli {
+                command: None,
+                query: Some("sqlite vector".to_string()),
+                path: Some(PathBuf::from("docs")),
+            }
+        );
+    }
+
+    #[test]
+    fn index_subcommands_parse_through_clap() {
+        let cli = parse_cli_from(["zg", "index", "status", "docs"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Index {
+                command: IndexCommands::Status {
+                    path: Some(PathBuf::from("docs")),
+                },
+            })
+        );
     }
 
     #[test]

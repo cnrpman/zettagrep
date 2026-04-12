@@ -111,31 +111,25 @@ Running `zg index init /some/project` creates:
 - FTS/vector readiness
 - last sync time
 
-## Embedding model path
+## Embedding model download
 
-On macOS, `zg` looks for a bundled local model in this order:
+`zg` now relies on `fastembed-rs` built-in model download support for the
+hard-coded `ParaphraseMLMiniLML12V2Q` model.
 
-1. `ZG_MODEL_DIR`
-2. `<prefix>/share/zg/models`
-3. `~/Library/Application Support/zg/models` if it already exists
+The download/cache path works like this:
 
-If no bundled model is found, `zg` fails fast. v1 does not use first-run model downloads as a fallback path.
+1. `HF_HOME` if set
+2. otherwise `FASTEMBED_CACHE_DIR` if set
+3. otherwise fastembed's default cache directory
 
-## Resource workflow
+Proxy and mirror behavior is delegated to the upstream stack:
 
-The repo uses a two-step asset flow:
-
-1. `resources/` is the repo-local bundled asset area.
-2. A local run script mirrors the bundled model into the development runtime path before launch.
+- `HTTP_PROXY` / `HTTPS_PROXY`
+- lowercase `http_proxy` / `https_proxy`
+- `HF_ENDPOINT` for a Hugging Face mirror
 
 Commands:
 
 ```bash
-scripts/prepare-model.sh /path/to/downloaded/model-dir
 scripts/run-local.sh search "sqlite adapter" .
 ```
-
-Defaults:
-
-- bundled repo model: `resources/models/bge-small-en-v1.5`
-- local development staging target: `target/share/zg/models`

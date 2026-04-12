@@ -110,33 +110,3 @@ pub fn covering_index_roots(path: &Path) -> Vec<PathBuf> {
 pub fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
     path.strip_prefix(root).ok().map(Path::to_path_buf)
 }
-
-pub fn bundled_embedding_model_dir() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("ZG_MODEL_DIR").map(PathBuf::from) {
-        return Some(path);
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        if let Some(prefix) = exe.parent().and_then(Path::parent) {
-            let shared = prefix.join("share").join("zg").join("models");
-            if shared.exists() {
-                return Some(shared);
-            }
-        }
-    }
-
-    let app_support = macos_app_support_dir().ok()?.join("models");
-    if app_support.exists() {
-        return Some(app_support);
-    }
-
-    None
-}
-
-fn macos_app_support_dir() -> ZgResult<PathBuf> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| other("HOME is not set"))?;
-
-    Ok(home.join("Library").join("Application Support").join("zg"))
-}
