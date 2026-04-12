@@ -259,4 +259,16 @@ mod tests {
         let files = rel_names(&child, collect_candidate_files(&child).unwrap());
         assert_eq!(files, vec!["keep.md"]);
     }
+
+    #[test]
+    fn candidate_collection_only_indexes_document_like_files() {
+        let root = temp_dir("document-only");
+        fs::write(root.join("notes.md"), "note").unwrap();
+        fs::write(root.join("journal.rst"), "entry").unwrap();
+        fs::write(root.join("code.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("config.toml"), "name = 'zg'").unwrap();
+
+        let files = rel_names(&root, collect_candidate_files(&root).unwrap());
+        assert_eq!(files, vec!["journal.rst", "notes.md"]);
+    }
 }

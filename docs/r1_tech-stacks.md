@@ -16,11 +16,11 @@ Date: 2026-04-12
 | Dependency | Locked version | Repo usage | Maintenance signal | Compatibility with current repo | Verdict |
 | --- | --- | --- | --- | --- | --- |
 | `anyhow` | `1.0.102` | `src/lib.rs` 与 `src/main.rs`，负责应用层错误收口 | `anyhow` 是 Rust 应用层事实标准之一；docs.rs 链接到 GitHub 约 `6.4k` stars | 兼容性高。当前 repo 是单 binary CLI，很适合 `anyhow::Result` 这种边界型错误收口 | 保留 |
+| `base64` | `0.22.1` | `src/search/ripgrep_backend.rs`，负责解析 `rg --json` 里的 bytes 字段 | `base64` 是 Rust 生态里的事实标准实现之一 | 兼容性高。当前只在 `rg --json` 非 UTF-8 字段兜底解析时使用，侵入性很低 | 保留 |
 | `blake3` | `1.8.4` | `src/index/util.rs`，负责 `content_hash` / `text_hash` 生成 | `blake3` 是主流高性能加密 hash crate，docs.rs 与官方 GitHub 都在持续维护 | 兼容性高。当前只需要稳定、快速、低碰撞风险的内容 hash，直接契合用途 | 强烈保留 |
 | `clap` | `4.6.0` | `src/main.rs`，负责顶层 CLI / 子命令 / help 生成 | `clap-rs/clap` GitHub 约 `15.8k` stars，2025-11 仍在持续发版 | 兼容性高。现在的 CLI 已经有默认入口、显式 `grep/search/index` 子命令，正适合 `clap` | 强烈保留 |
 | `fastembed` | `5.13.2` | `src/index/embed.rs`，负责本地 embedding 生成，当前写死使用 `ParaphraseMLMiniLML12V2Q` 并走 fastembed/hf-hub 内建下载 | `fastembed-rs` 在 docs.rs 链接到 GitHub 约 `787` stars；docs.rs 显示 2026-02 到 2026-03 仍在连续发版 | 兼容性高。当前 repo 明确走本地 embedding，`passage:` / `query:` 前缀也和 upstream 示例一致；本地测试通过。但它的 transitive tree 很重，会带入 `ort`、`tokenizers`、`hf-hub`、`reqwest`、`image` 等 | 保留。它是当前语义检索路径的核心依赖，但要持续关注编译/体积/模型分发成本 |
-| `grep` | `0.4.1` | `src/search/ripgrep_backend.rs`，提供 ripgrep ecosystem facade | `grep` crate 属于 `BurntSushi/ripgrep` 生态；`ripgrep` GitHub 约 `62.3k` stars | 兼容性高。比直接拼 `grep-regex` + `grep-searcher` 更贴近 upstream 建议 | 强烈保留 |
-| `ignore` | `0.4.25` | `src/walk.rs`、`src/index/files.rs`、`src/search/ripgrep_backend.rs`、`src/index/util.rs` | 同属 `ripgrep` 生态；docs.rs 当前为 `0.4.25`；上游 `ripgrep` 约 `62.3k` stars | 兼容性非常高。你们明确要求 “ripgrep-style visibility rules”，这正是 `ignore` 的强项 | 强烈保留 |
+| `ignore` | `0.4.25` | `src/walk.rs`、`src/index/files.rs`、`src/index/util.rs`，负责 indexed traversal 的 ripgrep-style visibility rules | 同属 `ripgrep` 生态；docs.rs 当前为 `0.4.25`；上游 `ripgrep` 约 `62.3k` stars | 兼容性非常高。你们明确要求 indexed traversal 复用 ripgrep-style visibility rules，这正是 `ignore` 的强项 | 强烈保留 |
 | `regex-syntax` | `0.8.10` | `src/search/mod.rs`，负责 regex-like query 的语法分析与判定辅助 | `rust-lang/regex` GitHub 约 `3.8k` stars；`regex-syntax` 是同生态核心组件 | 兼容性高。当前只拿它做“是否像 regex”的更稳健判定，没有把整个搜索栈绑到新的正则 runtime 上 | 保留 |
 | `rusqlite` | `0.32.1` | `src/index/db.rs`、`src/index/sync.rs`、`src/index/hybrid.rs`，负责所有 SQLite 访问 | docs.rs 显示 `rusqlite` 最新线在 2026-03 仍有发布，仓库链接约 `4.1k` stars | 兼容性非常高。repo 的索引模型就是 SQLite-first，且 `bundled` feature 很适合这种自己控制 DB 文件的 CLI | 强烈保留。只是当前锁在较老 minor 线，后续可计划升级 |
 | `serde` | `1.0.228` | `src/index/types.rs` 里 `StateMirror` 序列化 | docs.rs 链接到 `serde-rs/serde` 约 `10.5k` stars；版本发布频率很高 | 兼容性非常高，且使用面很小很稳 | 强烈保留 |
@@ -35,7 +35,7 @@ Date: 2026-04-12
   - `rusqlite`
   - `serde`
   - `serde_json`
-  - `ignore` / `grep` / `regex-syntax` 所在的 ripgrep / rust-lang 生态
+  - `ignore` / `regex-syntax` 所在的 ripgrep / rust-lang 生态
 - 相对没那么“老牌基础设施”，但仍然是活跃维护中的，是:
   - `fastembed`
   - `sqlite-vec`
@@ -46,10 +46,12 @@ Date: 2026-04-12
   - 未使用的 `regex` -> 真正需要的 `regex-syntax`
 - 后续又完成了 1 个高价值替换:
   - 手写 FNV-like hash -> `blake3`
+- 再后续又完成了 1 个高价值替换:
+  - 库内 grep facade -> runtime `rg` subprocess backend
 
 ## Compatibility Notes
 
-- 本地 `cargo test` 在 2026-04-12 通过，共 `43` 个测试全部通过。
+- 本地 `cargo test` 在 2026-04-12 通过，共 `46` 个测试全部通过。
 - `Cargo.toml` 里声明 `edition = "2024"`、`rust-version = "1.85"`，说明当前依赖组合至少对这个 repo 的工具链约束是可工作的。
 - 本地 `cargo run -- --help` 已确认新 CLI 入口可运行，help 输出保持 `zg <QUERY> [PATH]` / `zg <COMMAND>` 双入口模型。
 - 真正要持续关注的兼容性风险不是 `serde` / `rusqlite` 这种成熟库，而是:
@@ -76,7 +78,9 @@ Date: 2026-04-12
   - 用 `regex-syntax` 替代了纯字符启发式判断
   - 新增测试锁住 `C++`、`v1.2.3` 这类 plain text 不误判
 - `src/search/ripgrep_backend.rs`
-  - 改用 `grep` facade，减少 direct dependency 拼装层
+  - 不再自己维护 ripgrep 搜索逻辑，改为调用 runtime `rg`
+  - 运行时按 `ZG_RG_BIN` -> bundled `rg` -> `PATH` 顺序解析
+  - 不再自己枚举文件；regex traversal 交给 `rg` 本身递归
 - `src/index/util.rs`
   - 用 `blake3` 替掉了手写 FNV-like hash
   - 配合 schema version bump，避免旧索引和新 hash 语义混用
@@ -91,7 +95,7 @@ Date: 2026-04-12
 | --- | --- | --- | --- | --- |
 | `src/index/db.rs` 的 schema version / migration 管理 | 现在是 `create_schema` + `validate_schema` + 手工 `settings.schema_version` | `rusqlite_migration` | 这个 crate 就是给 `rusqlite` 用的，docs.rs 显示 2026-02 还有 `2.4.1` 发版 | 现在 schema 还小，可以继续手写；但一旦到 v4/v5，建议切 migration crate |
 | `src/index/files.rs` 的文本/二进制判断 | 现在是整文件读入后做 UTF-8 + control-char 白名单 | `content_inspector` | 这是现成的“快速猜测 text/binary”的库，理念也接近 `grep` / `git diff` | 如果以后遇到误判、性能或编码边界问题，再引入；当前不是第一优先级 |
-| `src/index/files.rs` 的文件类型白名单 | 现在是手写 `ALLOWED_EXTENSIONS` + `ALLOWED_BASENAMES` | 直接用 `ignore` 里的 type matcher，或 `globset` | 这块现在不是难写，而是策略表达比较原始；如果以后要支持“rg 风格类型族”或更复杂规则，这类库更自然 | 不是马上要改，但这是明确可以少自己维护的一块 |
+| `src/index/files.rs` 的文件类型白名单 | 现在是手写“文档型后缀 + 少量 basename”白名单 | 直接用 `ignore` 里的 type matcher，或 `globset` | 这块现在不是难写，而是策略表达比较原始；如果以后要支持“rg 风格类型族”或更复杂规则，这类库更自然 | 不是马上要改，但这是明确可以少自己维护的一块 |
 
 ## Modules I Would Keep Custom
 
@@ -139,10 +143,10 @@ Date: 2026-04-12
 ### Current deps
 
 - `anyhow`: [docs.rs crate page](https://docs.rs/crate/anyhow/latest)
+- `base64`: [docs.rs crate page](https://docs.rs/crate/base64/latest)
 - `blake3`: [docs.rs crate page](https://docs.rs/crate/blake3/latest), [GitHub repo](https://github.com/BLAKE3-team/BLAKE3)
 - `clap`: [docs.rs crate page](https://docs.rs/crate/clap/latest), [GitHub repo](https://github.com/clap-rs/clap)
 - `fastembed`: [docs.rs crate page](https://docs.rs/crate/fastembed/latest), [GitHub repo](https://github.com/Anush008/fastembed-rs)
-- `grep`: [docs.rs crate page](https://docs.rs/crate/grep/0.4.1), [ripgrep GitHub repo](https://github.com/BurntSushi/ripgrep)
 - `ignore`: [docs.rs crate page](https://docs.rs/crate/ignore/0.4.25/source/), [ripgrep GitHub repo](https://github.com/BurntSushi/ripgrep)
 - `regex-syntax`: [docs.rs crate page](https://docs.rs/crate/regex-syntax/latest), [GitHub repo](https://github.com/rust-lang/regex)
 - `rusqlite`: [docs.rs crate page](https://docs.rs/crate/rusqlite/%3E%3D0.32%2C%20%3C1.0), [GitHub repo](https://github.com/rusqlite/rusqlite)

@@ -1,6 +1,6 @@
 # zg
 
-`zg` is a local-first search CLI for note-heavy and text-heavy directories.
+`zg` is a local-first search CLI for note-heavy directories.
 
 The product contract is simple:
 
@@ -45,24 +45,35 @@ zg index status docs/
 ## Interaction and compatibility
 
 - `zg` is meant to feel familiar to users coming from `grep`, `ripgrep`, `ag`, or `find`.
-- There is no separate query language to learn before `zg <query> [path]` becomes useful.
+- There is no separate command to learn before `zg <query> [path]` becomes useful.
 - Operational notes stay non-blocking. Search does not pause for setup prompts or interactive maintenance flows.
-- v1 keeps the surface small and ships as a single binary.
+- v1 keeps the surface small. Indexed search is implemented in `zg`; regex search delegates to a runtime `rg` dependency.
 
-## Freshness model
+## Regex Backend
+
+`zg grep` and the regex-shaped branch of `zg <query>` delegate matching to
+`rg`.
+
+`zg` resolves the `rg` binary in this order:
+
+1. `ZG_RG_BIN`
+2. a bundled `rg` next to `zg`
+3. a bundled `rg` at `../libexec/rg` relative to `zg`
+4. `rg` from `PATH`
+
+## Index freshness model
 
 `zg` is lazy-first.
 
-- v1 does not run a watcher or daemon.
+- Does not run a watcher or daemon.
 - Search is the sync boundary: the current search scope is reconciled on demand when a search runs.
 - Reconcile only touches dirty, new, changed, or deleted content in the requested scope.
-- Missing work for indexed search is handled on the search path rather than forcing a separate maintenance step.
 - `zg index rebuild` remains the explicit full rebuild path.
 - `zg index delete` is the explicit local-cache removal path.
 
-This keeps the CLI small: users search first, and the system performs the minimum index maintenance needed for that search.
+This keeps the CLI simple: users search first, and the system performs the minimum index maintenance needed for that search.
 
-## Local index boundary
+## Index boundary
 
 Running `zg index init /some/project` creates:
 
@@ -85,31 +96,22 @@ Running `zg index init /some/project` creates:
 
 ## Index scope and content rules
 
-- Index eligibility is controlled by a suffix whitelist plus an encoding/character whitelist.
+- Index eligibility is controlled by a document suffix whitelist plus an encoding/character whitelist.
 - Symlinks are skipped during indexing and regex scanning.
-- Walk behavior follows ripgrep-style visibility rules:
+- Indexed traversal follows ripgrep-style visibility rules:
   parent ignore files, hidden-file filtering, `.ignore`, `.gitignore`, git excludes, and local `.zgignore`.
 - `.zg/` is always skipped during traversal.
-- v1 chunking is line-based.
-- The inline hard split marker is ` :: `.
-- Indexed chunks store both raw text and normalized text.
-- Common note decorators like list markers and Markdown headings get light cleanup before normalization.
+- Chunking is line-based.
+- The inline hard chunk split marker is ` :: `.
+
+Regex traversal is different:
+
+- `zg grep` delegates to `rg`
+- local `.zgignore` is not part of the regex-path contract
 
 ## Diagnostics
 
-`zg index status [path]` is the human-readable diagnostics surface. Today it reports:
-
-- requested path
-- index root
-- whether the path is indexed
-- chunking mode
-- inline marker
-- scope policy
-- walk policy
-- dirty state and dirty reason
-- file and chunk counts
-- FTS/vector readiness
-- last sync time
+`zg index status [path]` is the human-readable diagnostics surface.
 
 ## Embedding model download
 

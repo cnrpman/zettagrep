@@ -6,7 +6,7 @@ pub(crate) const SCHEMA_VERSION: u32 = 5;
 pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_CHUNK_MODE: &str = "line";
 pub(crate) const DEFAULT_CHUNK_MARKER: &str = " :: ";
-pub(crate) const DEFAULT_SCOPE_POLICY: &str = "suffix + encoding/character whitelist";
+pub(crate) const DEFAULT_SCOPE_POLICY: &str = "document suffix + encoding/character whitelist";
 pub(crate) const DEFAULT_VECTOR_PROVIDER: &str = "fastembed-ParaphraseMLMiniLML12V2Q";
 
 pub(crate) const VECTOR_DIMENSIONS: usize = 384;
@@ -15,18 +15,9 @@ pub(crate) const VECTOR_CANDIDATE_LIMIT: usize = 96;
 pub(crate) const RRF_K: f64 = 20.0;
 
 pub(crate) const ALLOWED_EXTENSIONS: &[&str] = &[
-    "c", "cc", "cfg", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "ini", "java", "js",
-    "json", "jsx", "kt", "kts", "log", "lua", "md", "markdown", "mjs", "py", "rb", "rs", "sass",
-    "scala", "scss", "sh", "sql", "swift", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml", "zsh",
+    "adoc", "asciidoc", "markdown", "md", "org", "rst", "text", "txt",
 ];
-pub(crate) const ALLOWED_BASENAMES: &[&str] = &[
-    "AGENTS.md",
-    "Dockerfile",
-    "LICENSE",
-    "Makefile",
-    "README",
-    "README.md",
-];
+pub(crate) const ALLOWED_BASENAMES: &[&str] = &["LICENSE", "README", "CHANGELOG", "CONTRIBUTING"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebuildStats {
