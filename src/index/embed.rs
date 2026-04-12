@@ -4,7 +4,6 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(not(test))]
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
-#[cfg(test)]
 use super::types::VECTOR_DIMENSIONS;
 use crate::{ZgResult, other};
 
@@ -32,25 +31,35 @@ fn embed(texts: &[String], prefix: &str) -> ZgResult<Vec<Vec<f32>>> {
         .map(|text| format!("{prefix}: {text}"))
         .collect::<Vec<_>>();
 
-    #[cfg(test)]
-    {
+    if force_deterministic_embeddings() {
         Ok(prefixed
             .iter()
-            .map(|text| deterministic_test_embedding(text))
+            .map(|text| deterministic_embedding(text))
             .collect())
+    } else {
+        #[cfg(not(test))]
+        let model = embedder()?;
+        #[cfg(not(test))]
+        let mut guard = model
+            .lock()
+            .map_err(|_| other("fastembed model lock poisoned"))?;
+        #[cfg(not(test))]
+        let embeddings = guard.embed(prefixed, None)?;
+
+        #[cfg(not(test))]
+        {
+            Ok(embeddings)
+        }
+        #[cfg(test)]
+        {
+            unreachable!("test builds always use deterministic embeddings")
+        }
     }
+}
 
-    #[cfg(not(test))]
-    let model = embedder()?;
-    #[cfg(not(test))]
-    let mut guard = model
-        .lock()
-        .map_err(|_| other("fastembed model lock poisoned"))?;
-    #[cfg(not(test))]
-    let embeddings = guard.embed(prefixed, None)?;
-
-    #[cfg(not(test))]
-    Ok(embeddings)
+fn force_deterministic_embeddings() -> bool {
+    // Keeps CLI integration tests hermetic without touching real model downloads.
+    cfg!(test) || std::env::var_os("ZG_TEST_FAKE_EMBEDDINGS").is_some()
 }
 
 #[cfg(not(test))]
@@ -109,8 +118,7 @@ fn fastembed_env_summary() -> String {
     }
 }
 
-#[cfg(test)]
-fn deterministic_test_embedding(text: &str) -> Vec<f32> {
+fn deterministic_embedding(text: &str) -> Vec<f32> {
     let mut vector = vec![0.0; VECTOR_DIMENSIONS];
     for (index, byte) in text.bytes().enumerate() {
         let slot = index % VECTOR_DIMENSIONS;

@@ -2,12 +2,14 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-pub(crate) const SCHEMA_VERSION: u32 = 6;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_FILE_LINES: usize = 100_000;
-pub(crate) const DEFAULT_CHUNK_MODE: &str = "line";
+pub(crate) const DEFAULT_CHUNK_MODE: &str = "line+short-merge";
 pub(crate) const DEFAULT_CHUNK_MARKER: &str = " :: ";
-pub(crate) const DEFAULT_SCOPE_POLICY: &str = "document suffix + encoding/character whitelist";
+pub(crate) const DEFAULT_SHORT_CHUNK_MERGE_MAX_CHARS: usize = 48;
+pub(crate) const DEFAULT_SCOPE_POLICY: &str =
+    "document suffix + supported code language whitelist + encoding/character whitelist";
 pub(crate) const DEFAULT_VECTOR_PROVIDER: &str = "fastembed-ParaphraseMLMiniLML12V2Q";
 
 pub(crate) const VECTOR_DIMENSIONS: usize = 384;
@@ -31,12 +33,17 @@ pub struct RebuildStats {
 pub struct SearchHit {
     pub rel_path: String,
     pub snippet: String,
+    pub line_start: usize,
+    pub line_end: usize,
     pub score: f64,
     pub lexical_score: f64,
     pub vector_score: f64,
+    pub(crate) chunk_index: usize,
+    pub(crate) chunk_kind: String,
+    pub(crate) language: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IndexStatus {
     pub requested_path: PathBuf,
     pub index_root: Option<PathBuf>,
@@ -76,7 +83,12 @@ pub(crate) struct IndexedChunk {
     pub(crate) line_end: usize,
     pub(crate) raw_text: String,
     pub(crate) normalized_text: String,
-    pub(crate) normalized_text_hash: String,
+    pub(crate) shared_normalized_text: String,
+    pub(crate) shared_normalized_text_hash: String,
+    pub(crate) chunk_kind: String,
+    pub(crate) language: Option<String>,
+    pub(crate) symbol_kind: Option<String>,
+    pub(crate) container: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +109,11 @@ pub(crate) struct StateRow {
 pub(crate) struct StoredChunk {
     pub(crate) chunk_id: i64,
     pub(crate) rel_path: String,
-    pub(crate) raw_text: String,
+    pub(crate) chunk_index: usize,
+    pub(crate) line_start: usize,
+    pub(crate) line_end: usize,
+    pub(crate) chunk_kind: String,
+    pub(crate) language: Option<String>,
     pub(crate) lexical_score: f64,
     pub(crate) vector_score: f64,
 }

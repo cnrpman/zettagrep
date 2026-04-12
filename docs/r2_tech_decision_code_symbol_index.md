@@ -11,23 +11,27 @@ Date: 2026-04-12
 
 - Python
 - Rust
-- C
-- C++
-- Java
 - JavaScript
-- TypeScript
+- TypeScript / TSX
 
 ## Symbol Chunk
 
-每个 symbol 产出一条统一的 `search_text`，BM25 和 vector 都吃这一份。
+每个 symbol 同时产出两份文本：
 
-`search_text` 只由这些字段合成：
+1. `search_text`
+   给 BM25 用，字段较全。
+
+2. `embed_text`
+   给共享 embedding 用，只保留 symbol subtree 里的 identifier 意群。
+
+`search_text` 由这些字段合成：
 
 - `symbol_name`
 - `signature_text`
 - `doc_text`
 - `container`
 - `path`
+- a small de-duplicated identifier bag from the symbol subtree
 
 file-local metadata 保留：
 
@@ -59,15 +63,15 @@ file-local metadata 保留：
 
 规则：
 
-- shared identity 仍然是 `normalized_text`
-- 同一 `.zg` 根内，相同 canonical symbol text 只 embed 一次
-- rename / move 后，如果 canonical text 不变，embedding 可复用
+- shared identity 仍然是 `embed_text`
+- 同一 `.zg` 根内，相同 `embed_text` 只 embed 一次
+- rename / move 后，如果 identifier 意群不变，embedding 可复用
 
 约束：
 
-- shared canonical text 里不能放 `path`
-- 否则 rename 会破坏复用
-- `path` / `container` 留在 file-local ref metadata 里
+- `embed_text` 里不能放 `path`
+- `embed_text` 不放 `signature/doc/path/container` 这类壳子
+- `path` / `container` 留在 file-local ref metadata 和 `search_text` 里
 
 ## Schema Impact
 

@@ -1,0 +1,8 @@
+{
+  "id": "ripgrep-14.1.1",
+  "description": "Fixed high-level evaluation vault based on the ripgrep 14.1.1 release source tree.",
+  "repository": "https://github.com/BurntSushi/ripgrep",
+  "tag": "14.1.1",
+  "commit": "4649aa9700619f94cf9c66876e9549d83420e16c",
+  "checkout_dir": ".cache/ripgrep-14.1.1"
+}

@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
+use super::code_symbols::{build_symbol_chunks, supports_code_symbol_indexing};
 use crate::paths;
 use crate::walk;
 use crate::{ZgResult, normalize_query};
 
 use super::types::{
     ALLOWED_BASENAMES, ALLOWED_EXTENSIONS, DEFAULT_CHUNK_MARKER, DEFAULT_MAX_FILE_BYTES,
-    DEFAULT_MAX_FILE_LINES, IndexedChunk, IndexedDocument,
+    DEFAULT_MAX_FILE_LINES, DEFAULT_SHORT_CHUNK_MERGE_MAX_CHARS, IndexedChunk, IndexedDocument,
 };
 use super::util::{has_zg_component, modified_unix_ms, stable_hash};
 
@@ -142,7 +143,11 @@ pub(crate) fn load_indexable_document(path: &Path) -> ZgResult<Option<IndexedDoc
         return Ok(None);
     }
 
-    let chunks = build_chunks(&body)?;
+    let chunks = if supports_code_symbol_indexing(path) {
+        build_symbol_chunks(path, &body)
+    } else {
+        build_chunks(&body)?
+    };
     if chunks.is_empty() {
         return Ok(None);
     }
@@ -155,9 +160,17 @@ pub(crate) fn load_indexable_document(path: &Path) -> ZgResult<Option<IndexedDoc
     }))
 }
 
-fn build_chunks(body: &str) -> ZgResult<Vec<IndexedChunk>> {
-    let mut chunks = Vec::new();
+pub(crate) fn build_chunks(body: &str) -> ZgResult<Vec<IndexedChunk>> {
+    let mut pending = Vec::<ShortTextChunk>::new();
+    let mut base_chunks = Vec::<ShortTextChunk>::new();
     for (line_index, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            if !pending.is_empty() {
+                base_chunks.append(&mut pending);
+            }
+            continue;
+        }
+
         for raw_segment in line.split(DEFAULT_CHUNK_MARKER) {
             let raw_text = raw_segment.trim();
             if raw_text.is_empty() {
@@ -165,23 +178,84 @@ fn build_chunks(body: &str) -> ZgResult<Vec<IndexedChunk>> {
             }
 
             let cleaned = strip_line_decorator(raw_text);
-            let normalized_text = normalize_query(cleaned);
-            if normalized_text.is_empty() {
+            if normalize_query(cleaned).is_empty() {
                 continue;
             }
 
-            chunks.push(IndexedChunk {
-                chunk_index: chunks.len(),
+            pending.push(ShortTextChunk {
                 line_start: line_index + 1,
                 line_end: line_index + 1,
                 raw_text: cleaned.to_string(),
-                normalized_text: normalized_text.clone(),
-                normalized_text_hash: stable_hash(normalized_text.as_bytes()),
             });
+        }
+
+        if !pending.is_empty() {
+            base_chunks.append(&mut pending);
         }
     }
 
-    Ok(chunks)
+    if !pending.is_empty() {
+        base_chunks.append(&mut pending);
+    }
+
+    let merged = merge_short_text_chunks(base_chunks);
+
+    Ok(merged
+        .into_iter()
+        .enumerate()
+        .filter_map(|(chunk_index, pending)| {
+            let search_text = normalize_query(&pending.raw_text);
+            if search_text.is_empty() {
+                return None;
+            }
+
+            Some(IndexedChunk {
+                chunk_index,
+                line_start: pending.line_start,
+                line_end: pending.line_end,
+                raw_text: pending.raw_text,
+                normalized_text: search_text.clone(),
+                shared_normalized_text: search_text.clone(),
+                shared_normalized_text_hash: stable_hash(search_text.as_bytes()),
+                chunk_kind: "text".to_string(),
+                language: None,
+                symbol_kind: None,
+                container: None,
+            })
+        })
+        .collect())
+}
+
+fn merge_short_text_chunks(chunks: Vec<ShortTextChunk>) -> Vec<ShortTextChunk> {
+    let mut merged = Vec::new();
+    let mut idx = 0usize;
+    while idx < chunks.len() {
+        if chunks[idx].raw_text.chars().count() >= DEFAULT_SHORT_CHUNK_MERGE_MAX_CHARS {
+            merged.push(chunks[idx].clone());
+            idx += 1;
+            continue;
+        }
+
+        let mut current = chunks[idx].clone();
+        idx += 1;
+        while idx < chunks.len()
+            && chunks[idx].raw_text.chars().count() < DEFAULT_SHORT_CHUNK_MERGE_MAX_CHARS
+        {
+            current.line_end = chunks[idx].line_end;
+            current.raw_text.push('\n');
+            current.raw_text.push_str(&chunks[idx].raw_text);
+            idx += 1;
+        }
+        merged.push(current);
+    }
+    merged
+}
+
+#[derive(Clone)]
+struct ShortTextChunk {
+    line_start: usize,
+    line_end: usize,
+    raw_text: String,
 }
 
 fn strip_line_decorator(line: &str) -> &str {
@@ -223,6 +297,7 @@ fn candidate_file_size(path: &Path) -> ZgResult<Option<u64>> {
     let allowed = ALLOWED_EXTENSIONS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+        || supports_code_symbol_indexing(path)
         || ALLOWED_BASENAMES
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(file_name));
@@ -261,7 +336,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{collect_candidate_files, load_indexable_document, scan_candidate_files_until};
+    use super::{
+        build_chunks, collect_candidate_files, load_indexable_document, scan_candidate_files_until,
+    };
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -314,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_collection_only_indexes_document_like_files() {
+    fn candidate_collection_indexes_documents_and_supported_code_languages() {
         let root = temp_dir("document-only");
         fs::write(root.join("notes.md"), "note").unwrap();
         fs::write(root.join("journal.rst"), "entry").unwrap();
@@ -322,7 +399,7 @@ mod tests {
         fs::write(root.join("config.toml"), "name = 'zg'").unwrap();
 
         let files = rel_names(&root, collect_candidate_files(&root).unwrap());
-        assert_eq!(files, vec!["journal.rst", "notes.md"]);
+        assert_eq!(files, vec!["code.rs", "journal.rst", "notes.md"]);
     }
 
     #[test]
@@ -346,5 +423,20 @@ mod tests {
 
         let document = load_indexable_document(&file).unwrap();
         assert!(document.is_none());
+    }
+
+    #[test]
+    #[ignore = "debug helper to inspect emitted markdown chunks"]
+    fn dump_markdown_chunks_from_r2_doc() {
+        let body = fs::read_to_string("docs/r2_tech_decision_code_symbol_index.md").unwrap();
+        let chunks = build_chunks(&body).unwrap();
+        for chunk in chunks.into_iter().take(12) {
+            println!("---");
+            println!("raw_text: {}", chunk.raw_text);
+            println!("search_text: {}", chunk.normalized_text);
+            println!("embed_text: {}", chunk.shared_normalized_text);
+            println!("line_start: {}", chunk.line_start);
+            println!("line_end: {}", chunk.line_end);
+        }
     }
 }

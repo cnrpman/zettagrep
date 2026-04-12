@@ -1,6 +1,7 @@
 use anyhow::Error;
 use thiserror::Error;
 
+pub mod dev;
 pub mod index;
 pub mod messages;
 pub mod paths;

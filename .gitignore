@@ -3,3 +3,5 @@ Cargo.lock
 .omx/
 .doc/
 /.fastembed_cache/
+.agents/
+/resources/sample-vaults/.cache/

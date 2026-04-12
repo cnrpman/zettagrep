@@ -54,9 +54,8 @@ Date: 2026-04-12
    - `chunk_index`
    - `line_start`
    - `line_end`
-   - `raw_text`
-   - `normalized_text`
-   - `normalized_text_hash`
+    - `normalized_text`
+    - `normalized_text_hash`
 
 4. `vec_chunks` / `vec_index`
    改为挂在 `shared_chunk_id` 上，不再挂在 file-local chunk 上。
@@ -90,7 +89,7 @@ FTS / BM25 必须保留 occurrence。
 
 关键点：
 
-- hash 必须对 `normalized_text` 算，不对 `raw_text` 算
+- hash 必须对 `normalized_text` 算
 - 一次 reconcile 批次里，相同 normalized text 只 embed 一次
 - GC 必须放在 transaction 末尾
 
@@ -151,6 +150,19 @@ WHERE ...
 ```
 
 一个 shared embedding 展开成多个 file-local hits 是正确行为。
+
+## Display
+
+结果展示文本不再要求存进 `chunk_refs`。
+
+展示路径采用：
+
+1. 搜索先返回 `rel_path + chunk_index + line range`
+2. 结果物化阶段按文件分组回读文件
+3. 重新 chunk
+4. 用 `chunk_index` 取真实 snippet
+
+如果文件当前不可读或 chunk 重建失败，则允许 snippet 为空。
 
 ## Collision Rule
 

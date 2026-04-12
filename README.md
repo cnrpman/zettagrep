@@ -30,9 +30,9 @@ This section keeps short, user-facing answers to the questions most people ask f
 - How do I start using `zg`?
   Use `zg <query> [path]`. In most cases, that is the only command you need.
 - Do I need to build an index before searching?
-  No. Regex search works immediately, and plain-text search can create a local `.zg/` index for you when needed.
+  No. Regex search works immediately. Plain-text search can create a local `.zg/` index for you when needed, subject to the safety guards described below.
 - Will `zg` change my files?
-  No. The only local artifact it may create is a visible `.zg/` directory used for search indexing.
+  It does not rewrite your documents. It may create a visible `.zg/` directory for indexing and, on first indexed search, download the embedding model into the normal fastembed / Hugging Face cache.
 - Can I remove the index later?
   Yes. Run `zg index delete [path]` to remove the local `.zg/` directory for that scope.
 - What search algorithm does the index use?
@@ -41,8 +41,6 @@ This section keeps short, user-facing answers to the questions most people ask f
   It currently uses `fastembed` with the built-in `ParaphraseMLMiniLML12V2Q` model.
 - How does chunking work?
   Chunking is line-based. Each line is a chunk by default, and a line can be split further with the inline marker ` :: `.
-- How big are common `tree-sitter-*` grammar crates together?
-  Snapshot on 2026-04-12, using docs.rs "Source code size" for `tree-sitter-python`, `tree-sitter-rust`, `tree-sitter-c`, `tree-sitter-cpp`, `tree-sitter-java`, `tree-sitter-javascript`, and `tree-sitter-typescript`: together they are about 57.19 MB of crate source. If you also count the core `tree-sitter` Rust binding crate, add about 1 MB. This is source package size, not final compiled binary size.
 
 ## Search semantics
 
@@ -119,7 +117,7 @@ Running `zg index init /some/project` creates:
 
 ## Index scope and content rules
 
-- Index eligibility is controlled by a document suffix whitelist plus an encoding/character whitelist.
+- Index eligibility is controlled by a document suffix whitelist, a supported code-language whitelist, and an encoding/character whitelist.
 - Files with more than `100000` lines are skipped during indexing.
 - Symlinks are skipped during indexing and regex scanning.
 - Indexed traversal follows ripgrep-style visibility rules:
@@ -133,31 +131,57 @@ Regex traversal is different:
 - `zg grep` delegates to `rg`
 - local `.zgignore` is not part of the regex-path contract
 
+Supported code symbol extraction languages in the current build:
+
+- Rust
+- Python
+- JavaScript
+- TypeScript / TSX
+
 ## Diagnostics
 
 `zg index status [path]` is the human-readable diagnostics surface.
 
-## Embedding model download
+## Developer Evaluation
 
-`zg` now relies on `fastembed-rs` built-in model download support for the
-hard-coded `ParaphraseMLMiniLML12V2Q` model.
+The repo now carries a fixed high-level evaluation vault and developer probes.
 
-The download/cache path works like this:
+- Sample vault: ripgrep `14.1.1`, fetched into `resources/sample-vaults/.cache/`
+- Search-quality fixture: `resources/search-quality/ripgrep-14.1.1.fixtures.json`
+- Search-quality golden: `resources/search-quality/ripgrep-14.1.1.golden.json`
 
-1. `HF_HOME` if set
-2. otherwise `FASTEMBED_CACHE_DIR` if set
-3. otherwise fastembed's default cache directory
-
-Proxy and mirror behavior is delegated to the upstream stack:
-
-- `HTTP_PROXY` / `HTTPS_PROXY`
-- lowercase `http_proxy` / `https_proxy`
-- `HF_ENDPOINT` for a Hugging Face mirror
-
-Commands:
+Convenience entry points:
 
 ```bash
-scripts/run-local.sh search "sqlite adapter" .
+scripts/ensure-sample-vault.sh
+scripts/eval-search-quality.sh
+scripts/probe-chunks.sh path/to/file.rs
+scripts/probe-db-cache.sh path/to/indexed/root
+```
+
+`scripts/eval-search-quality.sh` defaults `ZG_TEST_FAKE_EMBEDDINGS=1` so the
+ranking baseline stays deterministic in local runs and CI. If you want to
+inspect behavior with the real embedding backend instead, override that env var
+before running the script.
+
+## Embedding model download
+
+`zg` uses `fastembed` and the built-in `ParaphraseMLMiniLML12V2Q` model for
+vector search.
+
+The first indexed search on a machine may download model assets into the normal
+fastembed / Hugging Face cache. Exact cache precedence is delegated to the
+upstream stack. The main knobs are:
+
+- `HF_HOME`
+- `FASTEMBED_CACHE_DIR`
+- standard proxy variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`
+- `HF_ENDPOINT` for a Hugging Face mirror
+
+For local development:
+
+```bash
+cargo run -- search "sqlite adapter" .
 ```
 
 ## TODO

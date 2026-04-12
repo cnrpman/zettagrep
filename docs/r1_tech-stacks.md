@@ -51,7 +51,7 @@ Date: 2026-04-12
 
 ## Compatibility Notes
 
-- 本地 `cargo test` 在 2026-04-12 通过，共 `56` 个测试全部通过。
+- 本地 `cargo test` 在 2026-04-12 通过，共 `64` 个测试全部通过。
 - `Cargo.toml` 里声明 `edition = "2024"`、`rust-version = "1.85"`，说明当前依赖组合至少对这个 repo 的工具链约束是可工作的。
 - 本地 `cargo run -- --help` 已确认新 CLI 入口可运行，help 输出保持 `zg <QUERY> [PATH]` / `zg <COMMAND>` 双入口模型。
 - 真正要持续关注的兼容性风险不是 `serde` / `rusqlite` 这种成熟库，而是:

@@ -1,0 +1,128 @@
+{
+  "suite_id": "ripgrep-14.1.1",
+  "sample_vault_manifest": "../sample-vaults/ripgrep-14.1.1.json",
+  "default_limit": 5,
+  "cases": [
+    {
+      "id": "escape-os",
+      "query": "escape os",
+      "notes": "Exact identifier-style query should immediately surface the CLI escape helper.",
+      "expectations": {
+        "must_include": [
+          {
+            "path": "crates/cli/src/escape.rs",
+            "within_top": 1,
+            "snippet_contains": "escape_os"
+          }
+        ]
+      }
+    },
+    {
+      "id": "walkbuilder",
+      "query": "walkbuilder",
+      "notes": "WalkBuilder should stay easy to find from both the ignore README and the implementation.",
+      "limit": 8,
+      "expectations": {
+        "must_include": [
+          {
+            "path": "crates/ignore/README.md",
+            "within_top": 3,
+            "snippet_contains": "WalkBuilder"
+          },
+          {
+            "path": "crates/ignore/src/walk.rs",
+            "within_top": 6,
+            "snippet_contains": "WalkBuilder"
+          }
+        ]
+      }
+    },
+    {
+      "id": "haystack-builder",
+      "query": "haystack builder",
+      "notes": "Natural-language symbol lookup should retrieve both the flag-side builder entry point and the core haystack type.",
+      "limit": 8,
+      "expectations": {
+        "must_include": [
+          {
+            "path": "crates/core/flags/hiargs.rs",
+            "within_top": 3,
+            "snippet_contains": "haystack_builder"
+          },
+          {
+            "path": "crates/core/haystack.rs",
+            "within_top": 5,
+            "snippet_contains": "HaystackBuilder"
+          }
+        ]
+      }
+    },
+    {
+      "id": "json-builder",
+      "query": "JSONBuilder",
+      "notes": "Exact builder lookup should land on the JSON printer builder definition.",
+      "expectations": {
+        "must_include": [
+          {
+            "path": "crates/printer/src/json.rs",
+            "within_top": 1,
+            "snippet_contains": "JSONBuilder"
+          }
+        ]
+      }
+    },
+    {
+      "id": "regex-matcher-builder",
+      "query": "RegexMatcherBuilder",
+      "notes": "The regex matcher builder should outrank adjacent matcher surfaces while still keeping the PCRE2 variant visible.",
+      "limit": 10,
+      "expectations": {
+        "must_include": [
+          {
+            "path": "crates/regex/src/matcher.rs",
+            "within_top": 1,
+            "snippet_contains": "RegexMatcherBuilder"
+          },
+          {
+            "path": "crates/pcre2/src/matcher.rs",
+            "within_top": 10,
+            "snippet_contains": "RegexMatcherBuilder"
+          }
+        ]
+      }
+    },
+    {
+      "id": "default-buffer-capacity",
+      "query": "DEFAULT_BUFFER_CAPACITY",
+      "notes": "Constant lookup should anchor to the line buffer definition, not only to downstream tests.",
+      "expectations": {
+        "must_include": [
+          {
+            "path": "crates/searcher/src/line_buffer.rs",
+            "within_top": 1,
+            "snippet_contains": "DEFAULT_BUFFER_CAPACITY"
+          }
+        ]
+      }
+    },
+    {
+      "id": "json-printer",
+      "query": "json printer",
+      "notes": "Phrase query should keep both the CLI printer selection hook and the JSON printer implementation in view.",
+      "limit": 8,
+      "expectations": {
+        "must_include": [
+          {
+            "path": "crates/core/flags/hiargs.rs",
+            "within_top": 3,
+            "snippet_contains": "printer_json"
+          },
+          {
+            "path": "crates/printer/src/json.rs",
+            "within_top": 5
+          }
+        ]
+      }
+    }
+  ]
+}

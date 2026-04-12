@@ -1,4 +1,6 @@
+mod code_symbols;
 mod db;
+mod dev;
 mod embed;
 mod files;
 mod hybrid;
@@ -11,6 +13,11 @@ pub use hybrid::search_hybrid;
 pub use sync::{
     best_effort_overlap_note, delete_index, ensure_index_root_for_search, init_index, load_status,
     rebuild_index, reconcile_covering_roots,
+};
+pub use dev::{
+    ChunkProbeReport, DbCacheProbeReport, SearchQualityFixtureSuite, SearchQualityGoldenSuite,
+    SearchQualityReport, load_search_quality_fixture, load_search_quality_golden, probe_chunks,
+    probe_db_cache, run_search_quality_suite, write_search_quality_golden,
 };
 pub use types::{IndexStatus, RebuildStats, SearchHit};
 
@@ -76,6 +83,22 @@ mod tests {
         assert_eq!(shared_count, 1);
         assert_eq!(ref_count, 2);
         assert_eq!(vec_count, 1);
+    }
+
+    #[test]
+    fn code_symbol_search_indexes_supported_languages() {
+        let root = temp_dir("code-symbol-search");
+        fs::write(
+            root.join("parser.rs"),
+            "pub fn parse_query(input: &str) -> String {\n    let retry_backoff_ms = input.len();\n    retry_backoff_ms.to_string()\n}\n",
+        )
+        .unwrap();
+
+        init_index(&root).unwrap();
+        let hits = search_hybrid(&root, &root, "backoff", 10).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].rel_path, "parser.rs");
+        assert!(hits[0].snippet.contains("parse_query"));
     }
 
     #[test]

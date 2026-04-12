@@ -10,15 +10,15 @@ use crate::paths;
 
 use super::db::{
     create_schema, delete_by_rel_path, ensure_index_root, gc_unreferenced_shared_chunks,
-    load_file_rows_for_scope, load_state_mirror_status, mark_dirty, open_existing_db,
-    open_or_create_db, seed_defaults, set_dirty_state, status_for_index_root, upsert_document,
-    validate_schema, write_state_mirror,
+    load_file_rows_for_scope, load_state, load_state_mirror_status, mark_dirty, open_existing_db,
+    open_or_create_db, prepare_shared_chunk_vectors, reset_schema, seed_defaults, set_dirty_state,
+    status_for_index_root, upsert_document, validate_schema, write_state_mirror,
 };
 use super::files::{
     collect_candidate_files, collect_scope_candidates, load_indexable_document,
     scan_candidate_files_until,
 };
-use super::types::{IndexStatus, RebuildStats, SyncStats};
+use super::types::{IndexStatus, IndexedDocument, RebuildStats, StateRow, SyncStats};
 use super::util::{
     ancestor_index_root, descendant_index_root, modified_unix_ms, now_unix_ms, relative_path_string,
 };
@@ -90,19 +90,15 @@ pub fn rebuild_index(root: &Path) -> ZgResult<RebuildStats> {
     ensure_index_root(&root)?;
 
     let conn = open_or_create_db(&root)?;
+    if validate_schema(&conn).is_err() {
+        reset_schema(&conn)?;
+    }
     create_schema(&conn)?;
     seed_defaults(&conn)?;
 
     let started_at = now_unix_ms();
     let candidate_files = collect_candidate_files(&root)?;
-    let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM fts_chunks", [])?;
-    tx.execute("DELETE FROM chunk_refs", [])?;
-    tx.execute("DELETE FROM files", [])?;
-    tx.execute("DELETE FROM vec_index", [])?;
-    tx.execute("DELETE FROM vec_chunks", [])?;
-    tx.execute("DELETE FROM shared_chunks", [])?;
-
+    let mut pending_upserts = Vec::new();
     let mut indexed_files = 0usize;
     let mut chunks_indexed = 0usize;
     let mut warnings = Vec::new();
@@ -112,11 +108,34 @@ pub fn rebuild_index(root: &Path) -> ZgResult<RebuildStats> {
             Some(document) => {
                 let rel_path = relative_path_string(&root, path)?;
                 chunks_indexed += document.chunks.len();
-                upsert_document(&tx, &rel_path, &document)?;
+                pending_upserts.push(PendingDocument { rel_path, document });
                 indexed_files += 1;
             }
             None => warnings.push(format!("skipped {}", path.display())),
         }
+    }
+
+    let prepared_vectors = prepare_shared_chunk_vectors(
+        &pending_upserts
+            .iter()
+            .map(|pending| &pending.document)
+            .collect::<Vec<_>>(),
+    )?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM fts_chunks", [])?;
+    tx.execute("DELETE FROM chunk_refs", [])?;
+    tx.execute("DELETE FROM files", [])?;
+    tx.execute("DELETE FROM vec_index", [])?;
+    tx.execute("DELETE FROM vec_chunks", [])?;
+    tx.execute("DELETE FROM shared_chunks", [])?;
+
+    for pending in &pending_upserts {
+        upsert_document(
+            &tx,
+            &pending.rel_path,
+            &pending.document,
+            Some(&prepared_vectors),
+        )?;
     }
 
     tx.execute(
@@ -232,15 +251,21 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
     validate_schema(&conn)?;
 
     let existing = load_file_rows_for_scope(&conn, &root, &scope)?;
+    let current_state = load_state(&conn)?.unwrap_or(StateRow {
+        dirty: false,
+        dirty_reason: None,
+        last_sync_unix_ms: None,
+    });
     let candidate_files = collect_scope_candidates(&root, &scope)?;
     let mut seen = HashSet::new();
+    let mut pending_upserts = Vec::new();
+    let mut pending_deletes = Vec::new();
     let mut stats = SyncStats {
         indexed_files: 0,
         chunks_indexed: 0,
         warnings: Vec::new(),
     };
 
-    let tx = conn.unchecked_transaction()?;
     for path in candidate_files {
         let rel_path = relative_path_string(&root, &path)?;
         seen.insert(rel_path.clone());
@@ -259,10 +284,10 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
             Some(document) => {
                 stats.indexed_files += 1;
                 stats.chunks_indexed += document.chunks.len();
-                upsert_document(&tx, &rel_path, &document)?;
+                pending_upserts.push(PendingDocument { rel_path, document });
             }
             None => {
-                delete_by_rel_path(&tx, &rel_path)?;
+                pending_deletes.push(rel_path.clone());
                 stats.warnings.push(format!(
                     "skipped unreadable or disallowed file {}",
                     path.display()
@@ -273,21 +298,54 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
 
     for rel_path in existing.keys() {
         if !seen.contains(rel_path) {
-            delete_by_rel_path(&tx, rel_path)?;
+            pending_deletes.push(rel_path.clone());
         }
     }
-    gc_unreferenced_shared_chunks(&tx)?;
 
-    set_dirty_state(
-        &tx,
-        !stats.warnings.is_empty(),
-        stats.warnings.first().map(String::as_str),
-        Some(now_unix_ms()),
-    )?;
-    tx.commit()?;
+    let desired_dirty = !stats.warnings.is_empty();
+    let desired_reason = stats.warnings.first().cloned();
+    let needs_state_write =
+        current_state.dirty != desired_dirty || current_state.dirty_reason != desired_reason;
+
+    if !pending_upserts.is_empty() || !pending_deletes.is_empty() || needs_state_write {
+        let prepared_vectors = prepare_shared_chunk_vectors(
+            &pending_upserts
+                .iter()
+                .map(|pending| &pending.document)
+                .collect::<Vec<_>>(),
+        )?;
+        let tx = conn.unchecked_transaction()?;
+        for pending in &pending_upserts {
+            upsert_document(
+                &tx,
+                &pending.rel_path,
+                &pending.document,
+                Some(&prepared_vectors),
+            )?;
+        }
+        for rel_path in &pending_deletes {
+            delete_by_rel_path(&tx, rel_path)?;
+        }
+        if !pending_upserts.is_empty() || !pending_deletes.is_empty() {
+            gc_unreferenced_shared_chunks(&tx)?;
+        }
+
+        set_dirty_state(
+            &tx,
+            desired_dirty,
+            desired_reason.as_deref(),
+            Some(now_unix_ms()),
+        )?;
+        tx.commit()?;
+    }
 
     write_state_mirror(&root, &status_for_index_root(&root)?)?;
     Ok(stats)
+}
+
+struct PendingDocument {
+    rel_path: String,
+    document: IndexedDocument,
 }
 
 fn ensure_safe_implicit_init_root(root: &Path) -> ZgResult<()> {

@@ -16,7 +16,9 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn zg() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_zg"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zg"));
+    command.env("ZG_TEST_FAKE_EMBEDDINGS", "1");
+    command
 }
 
 #[test]
@@ -149,4 +151,65 @@ fn schema_mismatch_search_failure_tells_user_to_rebuild() {
     assert!(stderr.contains("index schema/version mismatch"));
     assert!(stderr.contains("zg index rebuild"));
     assert!(stderr.starts_with("zg:"));
+}
+
+#[test]
+fn indexed_search_prints_stable_result_line_shape() {
+    let root = temp_dir("indexed-output");
+    fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let output = zg()
+        .args(["search", "sqlite adapter"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("alpha.md  score="));
+    assert!(lines[0].contains("  lexical="));
+    assert!(lines[0].contains("  vector="));
+    assert!(lines[0].ends_with("sqlite vector adapter"));
+}
+
+#[test]
+fn indexed_search_stays_available_while_another_writer_holds_the_db_lock() {
+    let root = temp_dir("indexed-reader-while-write-locked");
+    fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let writer = Connection::open(root.join(".zg/index.db")).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             BEGIN IMMEDIATE;
+             UPDATE state SET dirty = dirty WHERE id = 1;",
+        )
+        .unwrap();
+
+    let output = zg()
+        .args(["search", "sqlite adapter"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    writer.execute_batch("ROLLBACK").unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("alpha.md  score="));
+    assert!(lines[0].ends_with("sqlite vector adapter"));
 }

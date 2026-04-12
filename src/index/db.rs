@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use rusqlite::auto_extension::{RawAutoExtension, register_auto_extension};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -26,6 +27,7 @@ pub(crate) fn open_or_create_db(root: &Path) -> ZgResult<Connection> {
     ensure_sqlite_vec_registered()?;
     let db_path = paths::db_path(root);
     let conn = Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(3))?;
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
@@ -99,12 +101,15 @@ pub(crate) fn create_schema(conn: &Connection) -> ZgResult<()> {
             id INTEGER PRIMARY KEY,
             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
             shared_chunk_id INTEGER NOT NULL REFERENCES shared_chunks(id),
+            chunk_kind TEXT NOT NULL,
+            language TEXT,
+            symbol_kind TEXT,
+            container TEXT,
             chunk_index INTEGER NOT NULL,
             line_start INTEGER NOT NULL,
             line_end INTEGER NOT NULL,
-            raw_text TEXT NOT NULL,
             normalized_text TEXT NOT NULL,
-            normalized_text_hash TEXT NOT NULL,
+            shared_normalized_text_hash TEXT NOT NULL,
             UNIQUE(file_id, chunk_index)
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
@@ -133,6 +138,21 @@ pub(crate) fn create_schema(conn: &Connection) -> ZgResult<()> {
             error TEXT
         );",
     ))?;
+    Ok(())
+}
+
+pub(crate) fn reset_schema(conn: &Connection) -> ZgResult<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS index_runs;
+         DROP TABLE IF EXISTS vec_chunks;
+         DROP TABLE IF EXISTS fts_chunks;
+         DROP TABLE IF EXISTS chunk_refs;
+         DROP TABLE IF EXISTS shared_chunks;
+         DROP TABLE IF EXISTS files;
+         DROP TABLE IF EXISTS state;
+         DROP TABLE IF EXISTS settings;
+         DROP TABLE IF EXISTS vec_index;",
+    )?;
     Ok(())
 }
 
@@ -298,6 +318,7 @@ pub(crate) fn upsert_document(
     conn: &Connection,
     rel_path: &str,
     document: &IndexedDocument,
+    prepared_vectors: Option<&HashMap<SharedChunkKey, Vec<f32>>>,
 ) -> ZgResult<()> {
     let old_counts = load_shared_ref_counts_for_rel_path(conn, rel_path)?;
     delete_file_rows_by_rel_path(conn, rel_path)?;
@@ -320,7 +341,7 @@ pub(crate) fn upsert_document(
     )?;
 
     let file_id = conn.last_insert_rowid();
-    let shared_chunk_ids = resolve_shared_chunk_ids(conn, &document.chunks)?;
+    let shared_chunk_ids = resolve_shared_chunk_ids(conn, &document.chunks, prepared_vectors)?;
     let mut new_counts = HashMap::<i64, i64>::new();
 
     for (chunk, shared_chunk_id) in document.chunks.iter().zip(shared_chunk_ids.into_iter()) {
@@ -328,22 +349,28 @@ pub(crate) fn upsert_document(
             "INSERT INTO chunk_refs (
                 file_id,
                 shared_chunk_id,
+                chunk_kind,
+                language,
+                symbol_kind,
+                container,
                 chunk_index,
                 line_start,
                 line_end,
-                raw_text,
                 normalized_text,
-                normalized_text_hash
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                shared_normalized_text_hash
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 file_id,
                 shared_chunk_id,
+                chunk.chunk_kind,
+                chunk.language,
+                chunk.symbol_kind,
+                chunk.container,
                 chunk.chunk_index as i64,
                 chunk.line_start as i64,
                 chunk.line_end as i64,
-                chunk.raw_text,
                 chunk.normalized_text,
-                chunk.normalized_text_hash,
+                chunk.shared_normalized_text_hash,
             ],
         )?;
         let chunk_ref_id = conn.last_insert_rowid();
@@ -356,6 +383,41 @@ pub(crate) fn upsert_document(
 
     apply_shared_ref_count_deltas(conn, &old_counts, &new_counts)?;
     Ok(())
+}
+
+type SharedChunkKey = (String, String);
+
+pub(crate) fn prepare_shared_chunk_vectors(
+    documents: &[&IndexedDocument],
+) -> ZgResult<HashMap<SharedChunkKey, Vec<f32>>> {
+    let mut unique_keys = Vec::new();
+    let mut seen = HashSet::<SharedChunkKey>::new();
+    for document in documents {
+        for chunk in &document.chunks {
+            let key = (
+                chunk.shared_normalized_text_hash.clone(),
+                chunk.shared_normalized_text.clone(),
+            );
+            if seen.insert(key.clone()) {
+                unique_keys.push(key);
+            }
+        }
+    }
+
+    if unique_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let texts = unique_keys
+        .iter()
+        .map(|(_, text)| text.clone())
+        .collect::<Vec<_>>();
+    let vectors = embed_passages(&texts)?;
+    if vectors.len() != unique_keys.len() {
+        return Err(other("fastembed returned unexpected embedding count"));
+    }
+
+    Ok(unique_keys.into_iter().zip(vectors).collect())
 }
 
 pub(crate) fn delete_by_rel_path(conn: &Connection, rel_path: &str) -> ZgResult<()> {
@@ -402,14 +464,15 @@ pub(crate) fn gc_unreferenced_shared_chunks(conn: &Connection) -> ZgResult<()> {
 fn resolve_shared_chunk_ids(
     conn: &Connection,
     chunks: &[super::types::IndexedChunk],
+    prepared_vectors: Option<&HashMap<SharedChunkKey, Vec<f32>>>,
 ) -> ZgResult<Vec<i64>> {
     let mut keys = Vec::with_capacity(chunks.len());
     let mut unique_keys = Vec::new();
     let mut seen = HashSet::<(String, String)>::new();
     for chunk in chunks {
         let key = (
-            chunk.normalized_text_hash.clone(),
-            chunk.normalized_text.clone(),
+            chunk.shared_normalized_text_hash.clone(),
+            chunk.shared_normalized_text.clone(),
         );
         if seen.insert(key.clone()) {
             unique_keys.push(key.clone());
@@ -437,19 +500,32 @@ fn resolve_shared_chunk_ids(
     }
 
     if !missing.is_empty() {
-        let normalized = missing
+        let mut embedded_missing = HashMap::<SharedChunkKey, Vec<f32>>::new();
+        let fallback_missing = missing
             .iter()
-            .map(|(_, text)| text.clone())
+            .filter(|key| prepared_vectors.is_none_or(|vectors| !vectors.contains_key(*key)))
+            .cloned()
             .collect::<Vec<_>>();
-        let vectors = embed_passages(&normalized)?;
-        if vectors.len() != missing.len() {
-            return Err(other("fastembed returned unexpected embedding count"));
+        if !fallback_missing.is_empty() {
+            let normalized = fallback_missing
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>();
+            let vectors = embed_passages(&normalized)?;
+            if vectors.len() != fallback_missing.len() {
+                return Err(other("fastembed returned unexpected embedding count"));
+            }
+            embedded_missing.extend(fallback_missing.into_iter().zip(vectors));
         }
 
         let now = now_unix_ms() as i64;
-        for ((hash, text), vector) in missing.into_iter().zip(vectors.into_iter()) {
+        for (hash, text) in missing {
+            let vector = prepared_vectors
+                .and_then(|vectors| vectors.get(&(hash.clone(), text.clone())))
+                .or_else(|| embedded_missing.get(&(hash.clone(), text.clone())))
+                .ok_or_else(|| other("failed to resolve prepared embedding for shared chunk"))?;
             conn.execute(
-                "INSERT INTO shared_chunks (
+                "INSERT OR IGNORE INTO shared_chunks (
                     normalized_text_hash,
                     normalized_text,
                     ref_count,
@@ -458,19 +534,20 @@ fn resolve_shared_chunk_ids(
                 ) VALUES (?1, ?2, 0, ?3, ?3)",
                 params![hash, text, now],
             )?;
-            let shared_chunk_id = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO vec_chunks (shared_chunk_id, dims, vector) VALUES (?1, ?2, ?3)",
-                params![
-                    shared_chunk_id,
-                    vector.len() as i64,
-                    super::hybrid::encode_vector(&vector)
-                ],
-            )?;
-            conn.execute(
-                "INSERT INTO vec_index (shared_chunk_id, embedding) VALUES (?1, ?2)",
-                params![shared_chunk_id, super::hybrid::encode_vector(&vector)],
-            )?;
+            let inserted = conn.changes() > 0;
+            let shared_chunk_id =
+                select_stmt.query_row(params![&hash, &text], |row| row.get::<_, i64>(0))?;
+            if inserted {
+                let encoded = super::hybrid::encode_vector(vector);
+                conn.execute(
+                    "INSERT INTO vec_chunks (shared_chunk_id, dims, vector) VALUES (?1, ?2, ?3)",
+                    params![shared_chunk_id, vector.len() as i64, &encoded],
+                )?;
+                conn.execute(
+                    "INSERT INTO vec_index (shared_chunk_id, embedding) VALUES (?1, ?2)",
+                    params![shared_chunk_id, &encoded],
+                )?;
+            }
             shared_ids.insert((hash, text), shared_chunk_id);
         }
     }

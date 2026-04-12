@@ -1,13 +1,16 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 use rusqlite::{Connection, params};
 
 use crate::{Query, ZgResult};
 
+use super::code_symbols::build_symbol_chunks;
 use super::db::{ensure_index_root, open_existing_db, validate_schema};
 use super::embed::embed_query;
+use super::files::build_chunks;
 use super::types::{
     FTS_CANDIDATE_LIMIT, RRF_K, ScopeKind, SearchHit, StoredChunk, VECTOR_CANDIDATE_LIMIT,
 };
@@ -33,7 +36,10 @@ pub fn search_hybrid(
     let query_vector = embed_query(normalized.normalized())?;
     let lexical_rows = lexical_candidates(&conn, &root, &scope, &normalized)?;
     let vector_rows = vector_candidates(&conn, &root, &scope, &query_vector)?;
-    Ok(merge_ranked_hits(lexical_rows, vector_rows, limit))
+    let hits = merge_ranked_hits(lexical_rows, vector_rows);
+    let mut hits = materialize_live_snippets(&root, hits);
+    hits.truncate(limit);
+    Ok(hits)
 }
 
 pub(crate) fn encode_vector(vector: &[f32]) -> Vec<u8> {
@@ -60,7 +66,7 @@ fn lexical_candidates(
     match scope_kind(root, scope)? {
         ScopeKind::Root => {
             let mut stmt = conn.prepare(
-                "SELECT cr.id, f.rel_path, cr.raw_text, cr.normalized_text, bm25(fts_chunks)
+                "SELECT cr.id, f.rel_path, cr.chunk_index, cr.line_start, cr.line_end, cr.chunk_kind, cr.language, cr.normalized_text, bm25(fts_chunks)
                  FROM fts_chunks
                  JOIN chunk_refs cr ON cr.id = fts_chunks.rowid
                  JOIN files f ON f.id = cr.file_id
@@ -71,12 +77,16 @@ fn lexical_candidates(
             collect_lexical_rows(stmt.query_map(
                 params![fts_query, FTS_CANDIDATE_LIMIT as i64],
                 |row| {
-                    let normalized_text: String = row.get(3)?;
-                    let bm25: f64 = row.get(4)?;
+                    let normalized_text: String = row.get(7)?;
+                    let bm25: f64 = row.get(8)?;
                     Ok(StoredChunk {
                         chunk_id: row.get(0)?,
                         rel_path: row.get(1)?,
-                        raw_text: row.get(2)?,
+                        chunk_index: row.get::<_, i64>(2)? as usize,
+                        line_start: row.get::<_, i64>(3)? as usize,
+                        line_end: row.get::<_, i64>(4)? as usize,
+                        chunk_kind: row.get(5)?,
+                        language: row.get(6)?,
                         lexical_score: lexical_score(&normalized_text, query, bm25),
                         vector_score: 0.0,
                     })
@@ -85,7 +95,7 @@ fn lexical_candidates(
         }
         ScopeKind::File(rel_path) => {
             let mut stmt = conn.prepare(
-                "SELECT cr.id, f.rel_path, cr.raw_text, cr.normalized_text, bm25(fts_chunks)
+                "SELECT cr.id, f.rel_path, cr.chunk_index, cr.line_start, cr.line_end, cr.chunk_kind, cr.language, cr.normalized_text, bm25(fts_chunks)
                  FROM fts_chunks
                  JOIN chunk_refs cr ON cr.id = fts_chunks.rowid
                  JOIN files f ON f.id = cr.file_id
@@ -97,12 +107,16 @@ fn lexical_candidates(
             collect_lexical_rows(stmt.query_map(
                 params![fts_query, rel_path, FTS_CANDIDATE_LIMIT as i64],
                 |row| {
-                    let normalized_text: String = row.get(3)?;
-                    let bm25: f64 = row.get(4)?;
+                    let normalized_text: String = row.get(7)?;
+                    let bm25: f64 = row.get(8)?;
                     Ok(StoredChunk {
                         chunk_id: row.get(0)?,
                         rel_path: row.get(1)?,
-                        raw_text: row.get(2)?,
+                        chunk_index: row.get::<_, i64>(2)? as usize,
+                        line_start: row.get::<_, i64>(3)? as usize,
+                        line_end: row.get::<_, i64>(4)? as usize,
+                        chunk_kind: row.get(5)?,
+                        language: row.get(6)?,
                         lexical_score: lexical_score(&normalized_text, query, bm25),
                         vector_score: 0.0,
                     })
@@ -111,7 +125,7 @@ fn lexical_candidates(
         }
         ScopeKind::Directory(rel_path, prefix) => {
             let mut stmt = conn.prepare(
-                "SELECT cr.id, f.rel_path, cr.raw_text, cr.normalized_text, bm25(fts_chunks)
+                "SELECT cr.id, f.rel_path, cr.chunk_index, cr.line_start, cr.line_end, cr.chunk_kind, cr.language, cr.normalized_text, bm25(fts_chunks)
                  FROM fts_chunks
                  JOIN chunk_refs cr ON cr.id = fts_chunks.rowid
                  JOIN files f ON f.id = cr.file_id
@@ -123,12 +137,16 @@ fn lexical_candidates(
             collect_lexical_rows(stmt.query_map(
                 params![fts_query, rel_path, prefix, FTS_CANDIDATE_LIMIT as i64],
                 |row| {
-                    let normalized_text: String = row.get(3)?;
-                    let bm25: f64 = row.get(4)?;
+                    let normalized_text: String = row.get(7)?;
+                    let bm25: f64 = row.get(8)?;
                     Ok(StoredChunk {
                         chunk_id: row.get(0)?,
                         rel_path: row.get(1)?,
-                        raw_text: row.get(2)?,
+                        chunk_index: row.get::<_, i64>(2)? as usize,
+                        line_start: row.get::<_, i64>(3)? as usize,
+                        line_end: row.get::<_, i64>(4)? as usize,
+                        chunk_kind: row.get(5)?,
+                        language: row.get(6)?,
                         lexical_score: lexical_score(&normalized_text, query, bm25),
                         vector_score: 0.0,
                     })
@@ -157,7 +175,11 @@ fn vector_candidates(
                 SELECT
                     cr.id,
                     f.rel_path,
-                    cr.raw_text,
+                    cr.chunk_index,
+                    cr.line_start,
+                    cr.line_end,
+                    cr.chunk_kind,
+                    cr.language,
                     km.distance
                 FROM knn_matches km
                 JOIN chunk_refs cr ON cr.shared_chunk_id = km.shared_chunk_id
@@ -186,7 +208,11 @@ fn vector_candidates(
                 SELECT
                     cr.id,
                     f.rel_path,
-                    cr.raw_text,
+                    cr.chunk_index,
+                    cr.line_start,
+                    cr.line_end,
+                    cr.chunk_kind,
+                    cr.language,
                     km.distance
                 FROM knn_matches km
                 JOIN chunk_refs cr ON cr.shared_chunk_id = km.shared_chunk_id
@@ -216,7 +242,11 @@ fn vector_candidates(
                 SELECT
                     cr.id,
                     f.rel_path,
-                    cr.raw_text,
+                    cr.chunk_index,
+                    cr.line_start,
+                    cr.line_end,
+                    cr.chunk_kind,
+                    cr.language,
                     km.distance
                 FROM knn_matches km
                 JOIN chunk_refs cr ON cr.shared_chunk_id = km.shared_chunk_id
@@ -240,7 +270,6 @@ fn vector_candidates(
 fn merge_ranked_hits(
     lexical_rows: Vec<StoredChunk>,
     vector_rows: Vec<StoredChunk>,
-    limit: usize,
 ) -> Vec<SearchHit> {
     let mut by_chunk = HashMap::<i64, StoredChunk>::new();
     let mut lexical_rank = HashMap::<i64, usize>::new();
@@ -256,9 +285,6 @@ fn merge_ranked_hits(
             .entry(row.chunk_id)
             .and_modify(|existing| {
                 existing.vector_score = row.vector_score;
-                if existing.raw_text.is_empty() {
-                    existing.raw_text = row.raw_text.clone();
-                }
                 if existing.rel_path.is_empty() {
                     existing.rel_path = row.rel_path.clone();
                 }
@@ -280,10 +306,15 @@ fn merge_ranked_hits(
                 .unwrap_or(0.0);
             SearchHit {
                 rel_path: row.rel_path,
-                snippet: render_snippet(&row.raw_text),
+                snippet: String::new(),
+                line_start: row.line_start,
+                line_end: row.line_end,
                 score: lexical_rrf + vector_rrf,
                 lexical_score: row.lexical_score,
                 vector_score: row.vector_score,
+                chunk_index: row.chunk_index,
+                chunk_kind: row.chunk_kind,
+                language: row.language,
             }
         })
         .collect::<Vec<_>>();
@@ -301,8 +332,47 @@ fn merge_ranked_hits(
             })
             .then_with(|| left.rel_path.cmp(&right.rel_path))
     });
-    hits.truncate(limit);
     hits
+}
+
+fn materialize_live_snippets(root: &Path, mut hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut by_path = HashMap::<String, Vec<usize>>::new();
+    for (idx, hit) in hits.iter().enumerate() {
+        by_path.entry(hit.rel_path.clone()).or_default().push(idx);
+    }
+    let mut keep = vec![false; hits.len()];
+
+    for (rel_path, hit_indexes) in by_path {
+        let file_path = root.join(&rel_path);
+        let Ok(bytes) = fs::read(&file_path) else {
+            continue;
+        };
+        let Ok(body) = String::from_utf8(bytes) else {
+            continue;
+        };
+        for hit_idx in hit_indexes {
+            let chunks = if hits[hit_idx].chunk_kind == "symbol" {
+                build_symbol_chunks(&file_path, &body)
+            } else {
+                let Ok(chunks) = build_chunks(&body) else {
+                    continue;
+                };
+                chunks
+            };
+            let Some(chunk) = chunks.get(hits[hit_idx].chunk_index) else {
+                continue;
+            };
+            hits[hit_idx].snippet = render_snippet(&chunk.raw_text);
+            hits[hit_idx].line_start = chunk.line_start;
+            hits[hit_idx].line_end = chunk.line_end;
+            keep[hit_idx] = true;
+        }
+    }
+
+    hits.into_iter()
+        .enumerate()
+        .filter_map(|(idx, hit)| keep[idx].then_some(hit))
+        .collect()
 }
 
 fn lexical_score(text: &str, query: &Query, bm25: f64) -> f64 {
@@ -336,11 +406,15 @@ fn collect_vector_rows(
 }
 
 fn vector_row_from_distance(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChunk> {
-    let distance: f64 = row.get(3)?;
+    let distance: f64 = row.get(7)?;
     Ok(StoredChunk {
         chunk_id: row.get(0)?,
         rel_path: row.get(1)?,
-        raw_text: row.get(2)?,
+        chunk_index: row.get::<_, i64>(2)? as usize,
+        line_start: row.get::<_, i64>(3)? as usize,
+        line_end: row.get::<_, i64>(4)? as usize,
+        chunk_kind: row.get(5)?,
+        language: row.get(6)?,
         lexical_score: 0.0,
         vector_score: 1.0 - distance,
     })
@@ -361,30 +435,68 @@ fn render_snippet(raw_text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{StoredChunk, merge_ranked_hits};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn row(
+    use super::{SearchHit, StoredChunk, materialize_live_snippets, merge_ranked_hits};
+    use crate::index::{init_index, search_hybrid};
+
+    struct Row<'a> {
         chunk_id: i64,
-        rel_path: &str,
-        raw_text: &str,
+        rel_path: &'a str,
+        chunk_index: usize,
+        line_start: usize,
+        line_end: usize,
         lexical: f64,
         vector: f64,
-    ) -> StoredChunk {
+    }
+
+    fn row(input: Row<'_>) -> StoredChunk {
         StoredChunk {
-            chunk_id,
-            rel_path: rel_path.to_string(),
-            raw_text: raw_text.to_string(),
-            lexical_score: lexical,
-            vector_score: vector,
+            chunk_id: input.chunk_id,
+            rel_path: input.rel_path.to_string(),
+            chunk_index: input.chunk_index,
+            line_start: input.line_start,
+            line_end: input.line_end,
+            chunk_kind: "text".to_string(),
+            language: None,
+            lexical_score: input.lexical,
+            vector_score: input.vector,
         }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zg-hybrid-{name}-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
     fn hybrid_merge_keeps_lexical_only_and_vector_only_candidates_visible() {
         let hits = merge_ranked_hits(
-            vec![row(1, "alpha.md", "alpha lexical hit", 2.0, 0.0)],
-            vec![row(2, "beta.md", "beta vector hit", 0.0, 0.9)],
-            10,
+            vec![row(Row {
+                chunk_id: 1,
+                rel_path: "alpha.md",
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                lexical: 2.0,
+                vector: 0.0,
+            })],
+            vec![row(Row {
+                chunk_id: 2,
+                rel_path: "beta.md",
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                lexical: 0.0,
+                vector: 0.9,
+            })],
         );
 
         assert_eq!(hits.len(), 2);
@@ -402,14 +514,45 @@ mod tests {
     fn hybrid_merge_rewards_dual_channel_hits() {
         let hits = merge_ranked_hits(
             vec![
-                row(1, "alpha.md", "alpha both", 1.5, 0.0),
-                row(2, "beta.md", "beta lexical only", 1.4, 0.0),
+                row(Row {
+                    chunk_id: 1,
+                    rel_path: "alpha.md",
+                    chunk_index: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    lexical: 1.5,
+                    vector: 0.0,
+                }),
+                row(Row {
+                    chunk_id: 2,
+                    rel_path: "beta.md",
+                    chunk_index: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    lexical: 1.4,
+                    vector: 0.0,
+                }),
             ],
             vec![
-                row(1, "alpha.md", "alpha both", 0.0, 0.8),
-                row(3, "gamma.md", "gamma vector only", 0.0, 0.7),
+                row(Row {
+                    chunk_id: 1,
+                    rel_path: "alpha.md",
+                    chunk_index: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    lexical: 0.0,
+                    vector: 0.8,
+                }),
+                row(Row {
+                    chunk_id: 3,
+                    rel_path: "gamma.md",
+                    chunk_index: 0,
+                    line_start: 1,
+                    line_end: 1,
+                    lexical: 0.0,
+                    vector: 0.7,
+                }),
             ],
-            10,
         );
 
         assert_eq!(hits[0].rel_path, "alpha.md");
@@ -421,5 +564,44 @@ mod tests {
             hits.iter()
                 .any(|hit| hit.rel_path == "gamma.md" && hit.vector_score > 0.0)
         );
+    }
+
+    #[test]
+    fn live_materialization_prefers_current_file_contents_over_stale_index_metadata() {
+        let root = temp_dir("materialize-live");
+        let file = root.join("alpha.md");
+        fs::write(&file, "- real visible line").unwrap();
+        init_index(&root).unwrap();
+
+        let conn = crate::index::db::open_existing_db(&root).unwrap();
+        conn.execute(
+            "UPDATE chunk_refs SET line_start = 999, line_end = 999 WHERE file_id IN (SELECT id FROM files WHERE rel_path = 'alpha.md')",
+            [],
+        )
+        .unwrap();
+
+        let hits = search_hybrid(&root, &root, "real visible", 10).unwrap();
+        assert_eq!(hits[0].snippet, "real visible line");
+        assert_eq!(hits[0].line_start, 1);
+    }
+
+    #[test]
+    fn materialize_live_snippets_drops_unreadable_results() {
+        let root = temp_dir("materialize-fallback");
+        let hits = vec![SearchHit {
+            rel_path: "missing.md".to_string(),
+            snippet: String::new(),
+            line_start: 1,
+            line_end: 1,
+            score: 1.0,
+            lexical_score: 1.0,
+            vector_score: 0.0,
+            chunk_index: 0,
+            chunk_kind: "text".to_string(),
+            language: None,
+        }];
+
+        let hits = materialize_live_snippets(&root, hits);
+        assert!(hits.is_empty());
     }
 }
