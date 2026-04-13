@@ -23,6 +23,55 @@ If a query looks like regex, `zg` behaves like grep. If it does not, `zg` uses a
 
 Most users should live on `zg <query> [path]`. The subcommands mainly make the mode explicit.
 
+## Build And Run
+
+`zg` is a standard Rust CLI.
+
+Requirements:
+
+- Rust `1.85` or newer
+- Cargo
+- `rg` (`ripgrep`) available at runtime, either from `PATH`, `ZG_RG_BIN`, or a bundled binary next to `zg`
+
+Build a debug binary:
+
+```bash
+cargo build
+```
+
+Build an optimized release binary:
+
+```bash
+cargo build --release
+```
+
+The release binary is written to:
+
+```text
+target/release/zg
+```
+
+Run without installing:
+
+```bash
+cargo run -- --help
+cargo run -- "sqlite adapter" .
+cargo run -- index init .
+```
+
+Install the CLI into Cargo's bin directory:
+
+```bash
+cargo install --path .
+zg --help
+```
+
+Verify the local build with:
+
+```bash
+cargo test
+```
+
 ## Quick answers
 
 This section keeps short, user-facing answers to the questions most people ask first.
@@ -30,7 +79,7 @@ This section keeps short, user-facing answers to the questions most people ask f
 - How do I start using `zg`?
   Use `zg <query> [path]`. In most cases, that is the only command you need.
 - Do I need to build an index before searching?
-  For regex search, no. For plain-text search, yes: build an explicit `.zg/` index first with `zg index init`.
+  Regex search works immediately. Plain-text search still requires an explicit `.zg/` index; if none exists, `zg` tells you to run `zg index init`.
 - Will `zg` change my files?
   It does not rewrite your documents. When you run `zg index init`, it creates a visible `.zg/` directory for indexing and, for `fts+vector`, may download the embedding model into the normal fastembed / Hugging Face cache.
 - Can I remove the index later?

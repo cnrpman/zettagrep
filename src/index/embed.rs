@@ -1,7 +1,9 @@
-#[cfg(not(test))]
-use std::sync::{Mutex, OnceLock};
+use std::fs::OpenOptions;
+use std::io::Write;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(test))]
+use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock as TestOnceLock};
 #[cfg(test)]
@@ -11,7 +13,7 @@ use std::thread::ThreadId;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use super::types::VECTOR_DIMENSIONS;
-use crate::{ZgResult, other};
+use crate::{other, ZgResult};
 
 #[cfg(not(test))]
 static TEXT_EMBEDDER: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
@@ -53,6 +55,9 @@ fn embed(texts: &[String], prefix: &str) -> ZgResult<Vec<Vec<f32>>> {
         }
     }
 
+    record_test_embed_invocation(prefix, texts.len())?;
+    maybe_delay_test_passage_embed(prefix)?;
+
     let prefixed = texts
         .iter()
         .map(|text| format!("{prefix}: {text}"))
@@ -87,6 +92,50 @@ fn embed(texts: &[String], prefix: &str) -> ZgResult<Vec<Vec<f32>>> {
 fn force_deterministic_embeddings() -> bool {
     // Keeps CLI integration tests hermetic without touching real model downloads.
     cfg!(test) || std::env::var_os("ZG_TEST_FAKE_EMBEDDINGS").is_some()
+}
+
+fn record_test_embed_invocation(prefix: &str, text_count: usize) -> ZgResult<()> {
+    let Some(path) = std::env::var_os("ZG_TEST_EMBED_LOG_PATH") else {
+        return Ok(());
+    };
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| {
+            other(format!(
+                "failed to open ZG_TEST_EMBED_LOG_PATH {}: {error}",
+                std::path::Path::new(&path).display()
+            ))
+        })?;
+    writeln!(file, "{prefix}\t{text_count}").map_err(|error| {
+        other(format!(
+            "failed to append ZG_TEST_EMBED_LOG_PATH {}: {error}",
+            std::path::Path::new(&path).display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn maybe_delay_test_passage_embed(prefix: &str) -> ZgResult<()> {
+    if prefix != "passage" {
+        return Ok(());
+    }
+
+    let Some(raw_delay_ms) = std::env::var_os("ZG_TEST_PASSAGE_EMBED_DELAY_MS") else {
+        return Ok(());
+    };
+    let raw_delay_ms = raw_delay_ms
+        .into_string()
+        .map_err(|_| other("ZG_TEST_PASSAGE_EMBED_DELAY_MS must be valid utf-8"))?;
+    let delay_ms = raw_delay_ms
+        .parse::<u64>()
+        .map_err(|_| other("ZG_TEST_PASSAGE_EMBED_DELAY_MS must be a non-negative integer"))?;
+    if delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -198,8 +247,8 @@ fn embed_capture_thread() -> &'static Mutex<Option<ThreadId>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_FASTEMBED_BATCH_SIZE, configured_fastembed_batch_size, test_begin_embed_capture_for_current_thread,
-        test_embed_counters, test_reset_embed_counters,
+        configured_fastembed_batch_size, test_begin_embed_capture_for_current_thread,
+        test_embed_counters, test_reset_embed_counters, DEFAULT_FASTEMBED_BATCH_SIZE,
     };
 
     #[test]
@@ -207,7 +256,10 @@ mod tests {
         unsafe {
             std::env::remove_var("ZG_FASTEMBED_BATCH_SIZE");
         }
-        assert_eq!(configured_fastembed_batch_size(), DEFAULT_FASTEMBED_BATCH_SIZE);
+        assert_eq!(
+            configured_fastembed_batch_size(),
+            DEFAULT_FASTEMBED_BATCH_SIZE
+        );
     }
 
     #[test]
