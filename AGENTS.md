@@ -1,0 +1,23 @@
+- Coding is the process of aligning codebase with intention
+- Principle 1: Truth Level Management
+	- Document Name: R*_<doc_name_in_lower_snake_case>.md
+		- e.g. R0_product_philosophy.md, R1_tech_decision_blabla.md
+		- where R* represents Rank, higher rank (smaller number) the more "truth" (aligned with the "good" taste from product owner / user), while lower rank (bigger number) the more "AI slop" (some non-verified AI generated item)
+	- All documents could be stale, except R0, which means the owner / user must maintain it carefully. Bigger number, bigger hallucination.
+	- Maintain comments & docstring in codebase for:
+		- Hard-to-understand code
+		- likely reuse code, for development experience
+		- explain design using docstring - but always ensure docstring aligned with code. if docstring is conflict with code, code first & rewrite / delete docstring immediately
+- Principle 2: Single direction of flows
+	- Editing flow, from true intent to actual implementation
+		- R0 documents -> R1 documents -> ... -> (Test Cases if TDD applied) -> Codebase
+	- Observation flow, from actual implementation, to principle level of intent, then to trivial design
+		- Codebase is the *De Facto* since document could be stale (except R0 document which should always under control)
+		- Codebase -> (Debugging / Observation Tools) -> comparison with R0 documents -> comparison with lower rank documents (if needed)
+	- Feed-back flow, from the reality to intention
+		- When a lower rank (e.g. finding during coding, observation, or real world fact) falsifies a higher rank after careful check, edit upward (usually by agent)
+		- The closer the change is to R0, the more the user must review it
+- Practice: Regression
+	- Agent write most Unit-testings during coding
+	- (High Rank) Documents -> Behavior testings (LLM + CLI) / E2E
+	- Try to consolidate each time an observation happens into the testings above if applicable & non-trivial

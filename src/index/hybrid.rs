@@ -8,13 +8,55 @@ use rusqlite::{Connection, params};
 use crate::{Query, ZgResult};
 
 use super::code_symbols::build_symbol_chunks;
-use super::db::{ensure_index_root, open_existing_db, validate_schema};
+use super::db::{ensure_index_root, load_index_level, open_existing_db, validate_schema};
 use super::embed::embed_query;
 use super::files::build_chunks;
 use super::types::{
-    FTS_CANDIDATE_LIMIT, RRF_K, ScopeKind, SearchHit, StoredChunk, VECTOR_CANDIDATE_LIMIT,
+    FTS_CANDIDATE_LIMIT, IndexLevel, RRF_K, ScopeKind, SearchHit, StoredChunk,
+    VECTOR_CANDIDATE_LIMIT,
 };
 use super::util::scope_kind;
+
+pub fn search_indexed(
+    root: &Path,
+    scope: &Path,
+    query: &str,
+    limit: usize,
+) -> ZgResult<Vec<SearchHit>> {
+    let root = crate::paths::resolve_existing_dir(root)?;
+    ensure_index_root(&root)?;
+    let conn = open_existing_db(&root)?;
+    validate_schema(&conn)?;
+
+    match load_index_level(&conn)? {
+        IndexLevel::Fts => search_fts(&root, scope, query, limit),
+        IndexLevel::FtsVector => search_hybrid(&root, scope, query, limit),
+    }
+}
+
+pub fn search_fts(
+    root: &Path,
+    scope: &Path,
+    query: &str,
+    limit: usize,
+) -> ZgResult<Vec<SearchHit>> {
+    let root = crate::paths::resolve_existing_dir(root)?;
+    ensure_index_root(&root)?;
+    let scope = crate::paths::resolve_existing_path(scope)?;
+    let conn = open_existing_db(&root)?;
+    validate_schema(&conn)?;
+
+    let normalized = Query::new(query);
+    if normalized.is_empty() {
+        return Err(crate::other("query is empty"));
+    }
+
+    let lexical_rows = lexical_candidates(&conn, &root, &scope, &normalized)?;
+    let hits = merge_ranked_hits(lexical_rows, Vec::new());
+    let mut hits = materialize_live_snippets(&root, hits);
+    hits.truncate(limit);
+    Ok(hits)
+}
 
 pub fn search_hybrid(
     root: &Path,

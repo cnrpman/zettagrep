@@ -1,8 +1,9 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::Serialize;
 
-pub(crate) const SCHEMA_VERSION: u32 = 9;
+pub(crate) const SCHEMA_VERSION: u32 = 10;
 pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_FILE_LINES: usize = 100_000;
 pub(crate) const DEFAULT_CHUNK_MODE: &str = "line+short-merge";
@@ -11,6 +12,11 @@ pub(crate) const DEFAULT_SHORT_CHUNK_MERGE_MAX_CHARS: usize = 48;
 pub(crate) const DEFAULT_SCOPE_POLICY: &str =
     "document suffix + supported code language whitelist + encoding/character whitelist";
 pub(crate) const DEFAULT_VECTOR_PROVIDER: &str = "fastembed-ParaphraseMLMiniLML12V2Q";
+pub(crate) const DEFAULT_INDEX_LEVEL: IndexLevel = IndexLevel::Fts;
+pub const FTS_PROMPT_MAX_CHUNKS: usize = 3_000;
+// Vector prompt gating is based on steady-state embedding throughput after model
+// initialization, not on cold-start wall time for a fresh CLI process.
+pub const VECTOR_PROMPT_MAX_CHUNKS: usize = 1_024;
 
 pub(crate) const VECTOR_DIMENSIONS: usize = 384;
 pub(crate) const FTS_CANDIDATE_LIMIT: usize = 96;
@@ -27,6 +33,45 @@ pub struct RebuildStats {
     pub scanned_files: usize,
     pub indexed_files: usize,
     pub chunks_indexed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum IndexLevel {
+    #[serde(rename = "fts")]
+    Fts,
+    #[serde(rename = "fts+vector")]
+    FtsVector,
+}
+
+impl IndexLevel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Fts => "fts",
+            Self::FtsVector => "fts+vector",
+        }
+    }
+
+    pub(crate) fn vectors_enabled(self) -> bool {
+        matches!(self, Self::FtsVector)
+    }
+}
+
+impl std::fmt::Display for IndexLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IndexLevel {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fts" => Ok(Self::Fts),
+            "fts+vector" => Ok(Self::FtsVector),
+            _ => Err("expected `fts` or `fts+vector`"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +93,7 @@ pub struct IndexStatus {
     pub requested_path: PathBuf,
     pub index_root: Option<PathBuf>,
     pub indexed: bool,
+    pub index_level: IndexLevel,
     pub chunk_mode: String,
     pub chunk_marker: String,
     pub scope_policy: String,
@@ -59,6 +105,8 @@ pub struct IndexStatus {
     pub chunk_count: u64,
     pub fts_ready: bool,
     pub vector_ready: bool,
+    pub last_index_run_status: Option<String>,
+    pub last_index_run_duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +171,7 @@ pub(crate) struct StateMirror {
     pub(crate) schema_version: u32,
     pub(crate) index_root: String,
     pub(crate) indexed: bool,
+    pub(crate) index_level: &'static str,
     pub(crate) chunk_mode: &'static str,
     pub(crate) chunk_marker: &'static str,
     pub(crate) scope_policy: &'static str,
@@ -134,6 +183,8 @@ pub(crate) struct StateMirror {
     pub(crate) chunk_count: u64,
     pub(crate) fts_ready: bool,
     pub(crate) vector_ready: bool,
+    pub(crate) last_index_run_status: Option<String>,
+    pub(crate) last_index_run_duration_ms: Option<u64>,
 }
 
 pub(crate) enum ScopeKind {

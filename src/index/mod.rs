@@ -8,18 +8,22 @@ mod sync;
 mod types;
 mod util;
 
-pub use files::collect_candidate_files;
-pub use hybrid::search_hybrid;
-pub use sync::{
-    best_effort_overlap_note, delete_index, ensure_index_root_for_search, init_index, load_status,
-    rebuild_index, reconcile_covering_roots,
-};
 pub use dev::{
     ChunkProbeReport, DbCacheProbeReport, SearchQualityFixtureSuite, SearchQualityGoldenSuite,
     SearchQualityReport, load_search_quality_fixture, load_search_quality_golden, probe_chunks,
     probe_db_cache, run_search_quality_suite, write_search_quality_golden,
 };
-pub use types::{IndexStatus, RebuildStats, SearchHit};
+pub use files::collect_candidate_files;
+pub use hybrid::{search_fts, search_hybrid, search_indexed};
+pub use sync::{
+    best_effort_overlap_note, delete_index, init_index, init_index_with_level, load_status,
+    rebuild_index, rebuild_index_with_level, reconcile_covering_roots,
+    require_index_root_for_search,
+};
+pub use types::{
+    FTS_PROMPT_MAX_CHUNKS, IndexLevel, IndexStatus, RebuildStats, SearchHit,
+    VECTOR_PROMPT_MAX_CHUNKS,
+};
 
 #[cfg(test)]
 mod tests {
@@ -39,13 +43,17 @@ mod tests {
         dir
     }
 
+    fn init_hybrid(root: &std::path::Path) {
+        init_index_with_level(root, IndexLevel::FtsVector).unwrap();
+    }
+
     #[test]
     fn rebuild_creates_searchable_index() {
         let root = temp_dir("rebuild");
         fs::write(root.join("alpha.md"), "sqlite :: vector adapter").unwrap();
         fs::write(root.join("beta.md"), "rust search tooling").unwrap();
 
-        let stats = init_index(&root).unwrap();
+        let stats = init_index_with_level(&root, IndexLevel::FtsVector).unwrap();
         assert_eq!(stats.indexed_files, 2);
 
         let hits = search_hybrid(&root, &root, "sqlite adapter", 10).unwrap();
@@ -56,12 +64,26 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_batches_embedding_work_across_all_documents() {
+        let root = temp_dir("rebuild-batch");
+        fs::write(root.join("alpha.md"), "alpha unique long line one abcdefghijklmnop").unwrap();
+        fs::write(root.join("beta.md"), "beta unique long line two abcdefghijklmnop").unwrap();
+
+        super::embed::test_begin_embed_capture_for_current_thread();
+        init_hybrid(&root);
+        let (calls, texts) = super::embed::test_embed_counters();
+
+        assert_eq!(calls, 1);
+        assert_eq!(texts, 2);
+    }
+
+    #[test]
     fn repeated_normalized_text_across_files_shares_embedding_owner() {
         let root = temp_dir("shared-owner");
         fs::write(root.join("alpha.md"), "- Shared Note").unwrap();
         fs::write(root.join("beta.md"), "# shared note").unwrap();
 
-        init_index(&root).unwrap();
+        init_hybrid(&root);
 
         let conn = super::db::open_existing_db(&root).unwrap();
         let shared_count = conn
@@ -94,7 +116,7 @@ mod tests {
         )
         .unwrap();
 
-        init_index(&root).unwrap();
+        init_hybrid(&root);
         let hits = search_hybrid(&root, &root, "backoff", 10).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].rel_path, "parser.rs");
@@ -108,7 +130,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         let file = nested.join("alpha.md");
         fs::write(&file, "first line").unwrap();
-        init_index(&root).unwrap();
+        init_hybrid(&root);
 
         fs::write(&file, "updated sqlite recall").unwrap();
         let active_root = reconcile_covering_roots(&nested).unwrap().unwrap();
@@ -120,11 +142,37 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_batches_embedding_work_across_dirty_documents() {
+        let root = temp_dir("reconcile-batch");
+        fs::write(root.join("alpha.md"), "alpha baseline long line abcdefghijklmnop").unwrap();
+        fs::write(root.join("beta.md"), "beta baseline long line abcdefghijklmnop").unwrap();
+        init_hybrid(&root);
+
+        fs::write(
+            root.join("alpha.md"),
+            "alpha changed long line one abcdefghijklmnop",
+        )
+        .unwrap();
+        fs::write(
+            root.join("beta.md"),
+            "beta changed long line two abcdefghijklmnop",
+        )
+        .unwrap();
+
+        super::embed::test_begin_embed_capture_for_current_thread();
+        reconcile_covering_roots(&root).unwrap();
+        let (calls, texts) = super::embed::test_embed_counters();
+
+        assert_eq!(calls, 1);
+        assert_eq!(texts, 2);
+    }
+
+    #[test]
     fn deleting_last_reference_gcs_shared_embedding() {
         let root = temp_dir("gc-shared");
         let file = root.join("alpha.md");
         fs::write(&file, "shared note").unwrap();
-        init_index(&root).unwrap();
+        init_hybrid(&root);
 
         fs::remove_file(&file).unwrap();
         reconcile_covering_roots(&root).unwrap();
@@ -155,7 +203,7 @@ mod tests {
     fn delete_index_removes_local_cache_directory() {
         let root = temp_dir("delete-index");
         fs::write(root.join("alpha.md"), "sqlite vector adapter").unwrap();
-        init_index(&root).unwrap();
+        init_hybrid(&root);
         assert!(root.join(".zg/index.db").exists());
 
         let removed = delete_index(&root).unwrap();
@@ -184,7 +232,7 @@ mod tests {
             "sqlite vector adapter and semantic ranking with extra noise",
         )
         .unwrap();
-        init_index(&root).unwrap();
+        init_hybrid(&root);
 
         let hits = search_hybrid(&root, &root.join("alpha.md"), "semantic ranking", 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -209,7 +257,7 @@ mod tests {
             "sqlite vector adapter for scoped semantic search",
         )
         .unwrap();
-        init_index(&root).unwrap();
+        init_hybrid(&root);
 
         let hits = search_hybrid(&root, &notes, "scoped semantic search", 10).unwrap();
         assert!(!hits.is_empty());
@@ -225,48 +273,34 @@ mod tests {
         fs::write(root.join("root.md"), "root entry").unwrap();
         fs::write(nested.join("today.md"), "today sqlite entry").unwrap();
         init_index(&root).unwrap();
-        init_index(&nested).unwrap();
+        init_hybrid(&nested);
 
         let active_root = reconcile_covering_roots(&nested).unwrap().unwrap();
         assert_eq!(active_root, nested);
     }
 
     #[test]
-    fn ensure_index_root_for_search_creates_directory_index_when_missing() {
-        let root = temp_dir("search-root");
-
-        // When no ancestor chain contains .zg, the search path creates a directory-level
-        // index root first; the lazy part is later reconcile/embed work inside that root.
-        let (index_root, stats) = ensure_index_root_for_search(&root).unwrap();
-        assert_eq!(index_root, root);
-        assert!(stats.is_some());
-        assert!(root.join(".zg/index.db").exists());
-    }
-
-    #[test]
-    fn ensure_index_root_for_search_reuses_nearest_ancestor_before_creating_new_root() {
+    fn require_index_root_for_search_reuses_nearest_ancestor() {
         let root = temp_dir("ancestor-root");
         let child = root.join("notes/daily");
         fs::create_dir_all(&child).unwrap();
         fs::create_dir_all(root.join(".zg")).unwrap();
         fs::write(root.join(".zg/index.db"), "").unwrap();
 
-        let (index_root, stats) = ensure_index_root_for_search(&child).unwrap();
+        let index_root = require_index_root_for_search(&child).unwrap();
         assert_eq!(index_root, root);
-        assert!(stats.is_none());
         assert!(!child.join(".zg/index.db").exists());
     }
 
     #[test]
-    fn ensure_index_root_for_search_uses_parent_directory_for_files_without_ancestor_index() {
+    fn require_index_root_for_search_errors_without_ancestor_index() {
         let root = temp_dir("file-root");
         let file = root.join("note.md");
         fs::write(&file, "").unwrap();
 
-        let (index_root, stats) = ensure_index_root_for_search(&file).unwrap();
-        assert_eq!(index_root, root);
-        assert!(stats.is_some());
-        assert!(root.join(".zg/index.db").exists());
+        let error = require_index_root_for_search(&file).unwrap_err();
+        assert!(error.to_string().contains("no ancestor .zg index found"));
+        assert!(!root.join(".zg/index.db").exists());
     }
 
     #[test]
@@ -284,7 +318,7 @@ mod tests {
     fn status_marks_vector_backend_unready_when_vec_index_drifts() {
         let root = temp_dir("vector-ready");
         fs::write(root.join("alpha.md"), "sqlite :: vector adapter").unwrap();
-        init_index(&root).unwrap();
+        init_hybrid(&root);
 
         let conn = super::db::open_existing_db(&root).unwrap();
         conn.execute("DELETE FROM vec_index", []).unwrap();
@@ -298,7 +332,7 @@ mod tests {
     fn rebuild_refreshes_schema_version_after_hash_upgrade() {
         let root = temp_dir("schema-upgrade");
         fs::write(root.join("alpha.md"), "sqlite :: vector adapter").unwrap();
-        init_index(&root).unwrap();
+        init_hybrid(&root);
 
         let conn = super::db::open_existing_db(&root).unwrap();
         conn.execute(
@@ -311,19 +345,5 @@ mod tests {
         let status = load_status(&root).unwrap();
         assert!(status.indexed);
         assert!(status.vector_ready);
-    }
-
-    #[test]
-    fn implicit_init_refuses_large_document_tree() {
-        let root = temp_dir("implicit-guard-threshold");
-        for idx in 0..2000 {
-            fs::write(root.join(format!("note-{idx:04}.md")), "note").unwrap();
-        }
-
-        let error = ensure_index_root_for_search(&root).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("zg: refusing to auto-create index"));
-        assert!(message.contains("2000 files"));
-        assert!(!root.join(".zg/index.db").exists());
     }
 }

@@ -9,16 +9,16 @@ The product contract is simple:
 - regex semantics stay intact for regex-shaped input
 - indexed search stays visible and local under `.zg/`
 
-If a query looks like regex, `zg` behaves like grep. If it does not, `zg` uses hybrid indexed search with lexical and vector signals together.
+If a query looks like regex, `zg` behaves like grep. If it does not, `zg` uses an explicit `.zg/` index. Indexed search has two levels: `fts` and `fts+vector`.
 
 ## Current surface
 
 - `zg <pattern-or-query> [path]`
 - `zg grep <pattern> [path]`
 - `zg search <query> [path]`
-- `zg index init [path]`
+- `zg index init [--level fts|fts+vector] [path]`
 - `zg index status [path]`
-- `zg index rebuild [path]`
+- `zg index rebuild [--level fts|fts+vector] [path]`
 - `zg index delete [path]`
 
 Most users should live on `zg <query> [path]`. The subcommands mainly make the mode explicit.
@@ -30,13 +30,13 @@ This section keeps short, user-facing answers to the questions most people ask f
 - How do I start using `zg`?
   Use `zg <query> [path]`. In most cases, that is the only command you need.
 - Do I need to build an index before searching?
-  No. Regex search works immediately. Plain-text search can create a local `.zg/` index for you when needed, subject to the safety guards described below.
+  For regex search, no. For plain-text search, yes: build an explicit `.zg/` index first with `zg index init`.
 - Will `zg` change my files?
-  It does not rewrite your documents. It may create a visible `.zg/` directory for indexing and, on first indexed search, download the embedding model into the normal fastembed / Hugging Face cache.
+  It does not rewrite your documents. When you run `zg index init`, it creates a visible `.zg/` directory for indexing and, for `fts+vector`, may download the embedding model into the normal fastembed / Hugging Face cache.
 - Can I remove the index later?
   Yes. Run `zg index delete [path]` to remove the local `.zg/` directory for that scope.
 - What search algorithm does the index use?
-  Plain-text search is hybrid: SQLite FTS5 handles keyword recall, vector search uses cosine similarity, and results are merged so exact wording and semantic similarity can both surface.
+  `fts` uses SQLite FTS5 only. `fts+vector` uses hybrid recall: SQLite FTS5 handles keyword recall, vector search uses cosine similarity, and results are merged so exact wording and semantic similarity can both surface.
 - What embedding model does it use?
   It currently uses `fastembed` with the built-in `ParaphraseMLMiniLML12V2Q` model.
 - How does chunking work?
@@ -46,13 +46,17 @@ This section keeps short, user-facing answers to the questions most people ask f
 
 - Regex is ground truth. Regex-shaped input always keeps regex semantics, even inside an indexed tree.
 - `zg grep` never requires an index.
-- Plain-text search uses hybrid recall: lexical and vector signals both participate in retrieval.
+- Plain-text search requires an explicit ancestor `.zg/` root.
 - `zg search` uses the nearest ancestor `.zg/` root.
-- If no ancestor `.zg/` exists, non-regex search may create a directory-level local index for the current search scope and continue the same request.
-- When the search target is a single file and there is no ancestor `.zg/`, `zg` uses the file's parent directory as the index root.
-- When search creates `.zg/` implicitly, `zg` tells you where it was created and reminds you that it can be removed later with `zg index delete`.
-- For safety, implicit index creation is refused on protected roots such as `/`, `$HOME`, and top-level user content directories like `~/Documents` or `~/Desktop`.
-- Implicit index creation is also refused for large document trees once the pre-scan hits `2000` candidate files or about `200` MB of candidate content. Use `zg index init <path>` to confirm in those cases.
+- Indexed search still reconciles dirty, changed, new, or deleted content lazily at search time, but it does not create a new `.zg/` root for you.
+- `zg index init --level fts` creates a lexical-only index.
+- `zg index init --level fts+vector` creates a hybrid lexical + vector index.
+
+## Choosing A Level
+
+- Choose `fts` when your workload is mostly keyword, symbol, identifier, path, or exact-phrase lookup and you want the lowest-latency default.
+- Choose `fts+vector` when you want natural-language or semantic recall and are willing to pay more build and query cost.
+- Start with `fts` by default. Upgrade later with `zg index rebuild --level fts+vector <path>` when the directory is small enough and semantic recall is worth it.
 
 Examples:
 
@@ -96,7 +100,7 @@ This keeps the CLI simple: users search first, and the system performs the minim
 
 ## Index boundary
 
-Running `zg index init /some/project` creates:
+Running `zg index init --level fts /some/project` or `zg index init --level fts+vector /some/project` creates:
 
 ```text
 /some/project/.zg/
@@ -109,7 +113,6 @@ Running `zg index init /some/project` creates:
 `.zg/` is the visible local partition boundary:
 
 - users can create it explicitly with `zg index init`
-- search can create it implicitly when indexed search needs a local root
 - users can remove it explicitly with `zg index delete`
 - nested `.zg/` roots are allowed
 - overlapping roots are allowed, with the expected tradeoff of more disk usage and slower updates
@@ -155,14 +158,28 @@ Convenience entry points:
 ```bash
 scripts/ensure-sample-vault.sh
 scripts/eval-search-quality.sh
+scripts/bench-sample-vault.sh
 scripts/probe-chunks.sh path/to/file.rs
 scripts/probe-db-cache.sh path/to/indexed/root
 ```
 
 `scripts/eval-search-quality.sh` defaults `ZG_TEST_FAKE_EMBEDDINGS=1` so the
-ranking baseline stays deterministic in local runs and CI. If you want to
-inspect behavior with the real embedding backend instead, override that env var
-before running the script.
+ranking baseline stays deterministic in local runs and CI. The eval path still
+uses a hybrid `fts+vector` index. If you want to inspect behavior with the real
+embedding backend instead, override that env var before running the script.
+
+`scripts/bench-sample-vault.sh` is the benchmark surface for developers. It
+reuses the same query fixture as search-quality evaluation, builds fresh scratch
+indexes for both `fts` and `fts+vector`, and prints or writes a structured
+timing report.
+
+Examples:
+
+```bash
+scripts/bench-sample-vault.sh
+scripts/bench-sample-vault.sh --fake-embeddings --json
+scripts/bench-sample-vault.sh --repeat 3 --out /tmp/zg-sample-bench.json
+```
 
 ## Embedding model download
 

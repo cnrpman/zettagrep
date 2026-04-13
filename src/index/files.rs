@@ -1,5 +1,7 @@
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use ignore::WalkBuilder;
 
@@ -14,11 +16,13 @@ use super::types::{
 };
 use super::util::{has_zg_component, modified_unix_ms, stable_hash};
 
+const DEFAULT_MAX_INDEX_WORKERS: usize = 8;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CandidateScanSummary {
+pub(crate) struct ChunkEstimate {
     pub(crate) candidate_files: usize,
-    pub(crate) total_size_bytes: u64,
-    pub(crate) limit_tripped: bool,
+    pub(crate) indexable_files: usize,
+    pub(crate) chunk_count: usize,
 }
 
 pub fn collect_candidate_files(scope: &Path) -> ZgResult<Vec<PathBuf>> {
@@ -51,56 +55,6 @@ pub fn collect_candidate_files(scope: &Path) -> ZgResult<Vec<PathBuf>> {
     }
 
     Ok(files)
-}
-
-pub(crate) fn scan_candidate_files_until(
-    scope: &Path,
-    max_files: usize,
-    max_total_bytes: u64,
-) -> ZgResult<CandidateScanSummary> {
-    let scope = paths::resolve_existing_path(scope)?;
-    let mut summary = CandidateScanSummary {
-        candidate_files: 0,
-        total_size_bytes: 0,
-        limit_tripped: false,
-    };
-
-    if scope.is_file() {
-        if let Some(size_bytes) = candidate_file_size(&scope)? {
-            summary.candidate_files = 1;
-            summary.total_size_bytes = size_bytes;
-            summary.limit_tripped =
-                summary.candidate_files >= max_files || summary.total_size_bytes >= max_total_bytes;
-        }
-        return Ok(summary);
-    }
-
-    let mut builder = WalkBuilder::new(&scope);
-    walk::apply_content_filters(&mut builder);
-
-    for entry in builder.build() {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        if file_type.is_symlink() || has_zg_component(path) || !file_type.is_file() {
-            continue;
-        }
-        let Some(size_bytes) = candidate_file_size(path)? else {
-            continue;
-        };
-
-        summary.candidate_files += 1;
-        summary.total_size_bytes += size_bytes;
-        if summary.candidate_files >= max_files || summary.total_size_bytes >= max_total_bytes {
-            summary.limit_tripped = true;
-            break;
-        }
-    }
-
-    Ok(summary)
 }
 
 pub(crate) fn collect_scope_candidates(root: &Path, scope: &Path) -> ZgResult<Vec<PathBuf>> {
@@ -158,6 +112,79 @@ pub(crate) fn load_indexable_document(path: &Path) -> ZgResult<Option<IndexedDoc
         content_hash: stable_hash(body.as_bytes()),
         chunks,
     }))
+}
+
+pub(crate) fn load_indexable_documents(
+    paths: &[PathBuf],
+) -> ZgResult<Vec<Option<IndexedDocument>>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = resolve_index_parallelism(
+        paths.len(),
+        configured_index_parallelism(),
+        default_available_parallelism(),
+    );
+    if worker_count == 1 {
+        return paths
+            .iter()
+            .map(|path| load_indexable_document(path))
+            .collect();
+    }
+
+    let chunk_size = paths.len().div_ceil(worker_count);
+    thread::scope(|scope| -> ZgResult<Vec<Option<IndexedDocument>>> {
+        let mut handles = Vec::new();
+        for batch_start in (0..paths.len()).step_by(chunk_size) {
+            let batch_end = usize::min(batch_start + chunk_size, paths.len());
+            let batch = &paths[batch_start..batch_end];
+            handles.push(scope.spawn(
+                move || -> ZgResult<Vec<(usize, Option<IndexedDocument>)>> {
+                    batch
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, path)| {
+                            Ok((batch_start + offset, load_indexable_document(path)?))
+                        })
+                        .collect()
+                },
+            ));
+        }
+
+        let mut loaded = Vec::with_capacity(paths.len());
+        for handle in handles {
+            let batch = handle
+                .join()
+                .map_err(|_| crate::other("index worker panicked"))??;
+            loaded.extend(batch);
+        }
+
+        // Preserve the caller's original path order so downstream upsert/delete/warning
+        // behavior stays deterministic even though file reads happen in parallel.
+        loaded.sort_by_key(|(index, _)| *index);
+        Ok(loaded.into_iter().map(|(_, document)| document).collect())
+    })
+}
+
+pub(crate) fn estimate_indexable_chunks(scope: &Path) -> ZgResult<ChunkEstimate> {
+    let candidate_files = collect_candidate_files(scope)?;
+    let loaded_documents = load_indexable_documents(&candidate_files)?;
+    let mut indexable_files = 0usize;
+    let mut chunk_count = 0usize;
+
+    for document in loaded_documents {
+        if let Some(document) = document {
+            indexable_files += 1;
+            chunk_count += document.chunks.len();
+        }
+    }
+
+    Ok(ChunkEstimate {
+        candidate_files: candidate_files.len(),
+        indexable_files,
+        chunk_count,
+    })
 }
 
 pub(crate) fn build_chunks(body: &str) -> ZgResult<Vec<IndexedChunk>> {
@@ -313,6 +340,35 @@ fn candidate_file_size(path: &Path) -> ZgResult<Option<u64>> {
     Ok(Some(metadata.len()))
 }
 
+fn default_available_parallelism() -> usize {
+    thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+fn configured_index_parallelism() -> Option<usize> {
+    std::env::var("ZG_INDEX_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn resolve_index_parallelism(
+    task_count: usize,
+    configured_workers: Option<usize>,
+    available_parallelism: usize,
+) -> usize {
+    if task_count <= 1 {
+        return 1;
+    }
+
+    let default_workers = available_parallelism.min(DEFAULT_MAX_INDEX_WORKERS).max(1);
+    configured_workers
+        .unwrap_or(default_workers)
+        .min(task_count)
+        .max(1)
+}
+
 fn exceeds_line_limit(body: &str) -> bool {
     body.lines().take(DEFAULT_MAX_FILE_LINES + 1).count() > DEFAULT_MAX_FILE_LINES
 }
@@ -337,7 +393,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        build_chunks, collect_candidate_files, load_indexable_document, scan_candidate_files_until,
+        build_chunks, collect_candidate_files, estimate_indexable_chunks, load_indexable_document,
+        load_indexable_documents, resolve_index_parallelism,
     };
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -403,18 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_candidate_scan_stops_after_threshold() {
-        let root = temp_dir("bounded-scan");
-        for idx in 0..4 {
-            fs::write(root.join(format!("note-{idx}.md")), "note").unwrap();
-        }
-
-        let summary = scan_candidate_files_until(&root, 3, u64::MAX).unwrap();
-        assert_eq!(summary.candidate_files, 3);
-        assert!(summary.limit_tripped);
-    }
-
-    #[test]
     fn load_indexable_document_skips_files_over_line_limit() {
         let root = temp_dir("line-limit");
         let file = root.join("huge.md");
@@ -423,6 +468,60 @@ mod tests {
 
         let document = load_indexable_document(&file).unwrap();
         assert!(document.is_none());
+    }
+
+    #[test]
+    fn concurrent_document_loading_preserves_input_order() {
+        let root = temp_dir("parallel-order");
+        let third = root.join("third.md");
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        fs::write(&third, "third document").unwrap();
+        fs::write(&first, "first document").unwrap();
+        fs::write(&second, "second document").unwrap();
+
+        let documents =
+            load_indexable_documents(&[third.clone(), first.clone(), second.clone()]).unwrap();
+        let snippets = documents
+            .into_iter()
+            .map(|document| {
+                document
+                    .unwrap()
+                    .chunks
+                    .first()
+                    .unwrap()
+                    .normalized_text
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            snippets,
+            vec!["third document", "first document", "second document"]
+        );
+    }
+
+    #[test]
+    fn index_parallelism_is_bounded_and_overridable() {
+        assert_eq!(resolve_index_parallelism(0, None, 12), 1);
+        assert_eq!(resolve_index_parallelism(1, None, 12), 1);
+        assert_eq!(resolve_index_parallelism(3, None, 12), 3);
+        assert_eq!(resolve_index_parallelism(10, None, 12), 8);
+        assert_eq!(resolve_index_parallelism(10, Some(2), 12), 2);
+        assert_eq!(resolve_index_parallelism(10, Some(20), 12), 10);
+    }
+
+    #[test]
+    fn chunk_estimate_counts_indexable_chunks() {
+        let root = temp_dir("chunk-estimate");
+        fs::write(root.join("a.md"), "alpha\nbeta\n").unwrap();
+        fs::write(root.join("b.rs"), "fn parse_query() {}\n").unwrap();
+        fs::write(root.join("skip.bin"), "ignored").unwrap();
+
+        let estimate = estimate_indexable_chunks(&root).unwrap();
+        assert_eq!(estimate.candidate_files, 2);
+        assert_eq!(estimate.indexable_files, 2);
+        assert!(estimate.chunk_count >= 2);
     }
 
     #[test]

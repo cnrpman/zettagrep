@@ -10,9 +10,9 @@ use crate::{ZgResult, other};
 
 use super::db::{open_existing_db, validate_schema};
 use super::files::load_indexable_document;
-use super::sync::{ensure_index_root_for_search, reconcile_covering_roots};
+use super::sync::{init_index_with_level, reconcile_covering_roots, require_index_root_for_search};
 use super::types::SearchHit;
-use super::{IndexStatus, load_status, search_hybrid};
+use super::{IndexLevel, IndexStatus, load_status, search_indexed};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SearchQualityFixtureSuite {
@@ -233,7 +233,7 @@ pub fn run_search_quality_suite(
         None => None,
     };
 
-    let (index_root, _) = ensure_index_root_for_search(&vault_root)?;
+    let index_root = ensure_eval_index(&vault_root)?;
     reconcile_covering_roots(&vault_root)?;
 
     let golden_cases = golden
@@ -254,7 +254,7 @@ pub fn run_search_quality_suite(
     for case in &fixture.cases {
         let limit = case.limit.unwrap_or(fixture.default_limit);
         let scope = resolve_case_scope(&vault_root, case.scope.as_deref())?;
-        let hits = search_hybrid(&index_root, &scope, &case.query, limit)?;
+        let hits = search_indexed(&index_root, &scope, &case.query, limit)?;
         let observed_hits = hits
             .into_iter()
             .enumerate()
@@ -420,10 +420,12 @@ pub fn probe_chunks(path: &Path) -> ZgResult<ChunkProbeReport> {
 pub fn probe_db_cache(path: &Path, limit: usize) -> ZgResult<DbCacheProbeReport> {
     let requested_path = paths::resolve_existing_path(path)?;
     let mut status = load_status(&requested_path)?;
-    let index_root = status
-        .index_root
-        .clone()
-        .ok_or_else(|| other(format!("no ancestor .zg index found for {}", requested_path.display())))?;
+    let index_root = status.index_root.clone().ok_or_else(|| {
+        other(format!(
+            "no ancestor .zg index found for {}",
+            requested_path.display()
+        ))
+    })?;
     let conn = open_existing_db(&index_root)?;
     validate_schema(&conn)?;
     status.requested_path = requested_path.clone();
@@ -465,14 +467,14 @@ fn build_search_quality_golden(
     vault_root: &Path,
 ) -> ZgResult<SearchQualityGoldenSuite> {
     let vault_root = paths::resolve_existing_dir(vault_root)?;
-    let (index_root, _) = ensure_index_root_for_search(&vault_root)?;
+    let index_root = ensure_eval_index(&vault_root)?;
     reconcile_covering_roots(&vault_root)?;
 
     let mut cases = Vec::new();
     for case in &fixture.cases {
         let limit = case.limit.unwrap_or(fixture.default_limit);
         let scope = resolve_case_scope(&vault_root, case.scope.as_deref())?;
-        let hits = search_hybrid(&index_root, &scope, &case.query, limit)?;
+        let hits = search_indexed(&index_root, &scope, &case.query, limit)?;
         cases.push(SearchQualityGoldenCase {
             id: case.id.clone(),
             query: case.query.clone(),
@@ -506,6 +508,16 @@ fn resolve_case_scope(vault_root: &Path, scope: Option<&str>) -> ZgResult<PathBu
     }
 }
 
+fn ensure_eval_index(vault_root: &Path) -> ZgResult<PathBuf> {
+    match require_index_root_for_search(vault_root) {
+        Ok(root) => Ok(root),
+        Err(_) => {
+            init_index_with_level(vault_root, IndexLevel::FtsVector)?;
+            require_index_root_for_search(vault_root)
+        }
+    }
+}
+
 fn observed_hit(rank: usize, hit: SearchHit, vault_root: &Path) -> SearchQualityObservedHit {
     SearchQualityObservedHit {
         rank,
@@ -520,9 +532,11 @@ fn observed_hit(rank: usize, hit: SearchHit, vault_root: &Path) -> SearchQuality
 }
 
 fn count_rows(conn: &rusqlite::Connection, table: &str) -> ZgResult<u64> {
-    Ok(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-        row.get::<_, i64>(0)
-    })? as u64)
+    Ok(
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })? as u64,
+    )
 }
 
 fn query_key_counts(conn: &rusqlite::Connection, sql: &str) -> ZgResult<Vec<KeyCount>> {

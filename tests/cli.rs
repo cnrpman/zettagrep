@@ -112,20 +112,18 @@ fn missing_path_returns_non_zero_exit_and_error_message() {
 }
 
 #[test]
-fn implicit_init_large_scope_refusal_is_actionable() {
-    let root = temp_dir("implicit-guard");
-    for idx in 0..2000 {
-        fs::write(root.join(format!("note-{idx:04}.md")), "note").unwrap();
-    }
+fn plain_search_without_explicit_index_is_actionable() {
+    let root = temp_dir("missing-index");
+    fs::write(root.join("note.md"), "plain search target").unwrap();
 
     let output = zg().arg("plain search").arg(&root).output().unwrap();
 
     assert!(!output.status.success());
 
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.starts_with("zg: refusing to auto-create index"));
-    assert!(stderr.contains("2000 files"));
-    assert!(stderr.contains("zg index init"));
+    assert!(stderr.starts_with("zg: no ancestor .zg index found"));
+    assert!(stderr.contains("zg index init --level fts"));
+    assert!(stderr.contains("zg index init --level fts+vector"));
     assert!(!stderr.contains("error:"));
 }
 
@@ -178,6 +176,22 @@ fn indexed_search_prints_stable_result_line_shape() {
     assert!(lines[0].contains("  lexical="));
     assert!(lines[0].contains("  vector="));
     assert!(lines[0].ends_with("sqlite vector adapter"));
+}
+
+#[test]
+fn index_init_defaults_to_fts_level() {
+    let root = temp_dir("default-level-cli");
+    fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let status = zg().args(["index", "status"]).arg(&root).output().unwrap();
+    assert!(status.status.success());
+
+    let stdout = String::from_utf8(status.stdout).unwrap();
+    assert!(stdout.contains("index level: fts"));
+    assert!(stdout.contains("vector ready: no"));
 }
 
 #[test]
@@ -250,6 +264,53 @@ fn dev_eval_search_quality_accepts_matching_fixture_and_golden() {
     assert!(stdout.contains("\"passed_cases\": 1"));
     assert!(stdout.contains("\"expectation_failures\": 0"));
     assert!(stdout.contains("\"golden_failures\": 0"));
+}
+
+#[test]
+fn dev_bench_sample_vault_runs_on_tiny_fixture() {
+    let root = temp_dir("dev-bench");
+    fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+    fs::write(root.join("beta.md"), "haystack builder\n").unwrap();
+
+    let fixture = root.join("fixture.json");
+    fs::write(
+        &fixture,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "suite_id": "bench-mini",
+            "sample_vault_manifest": "sample.json",
+            "default_limit": 2,
+            "cases": [
+                {
+                    "id": "sqlite-adapter",
+                    "query": "sqlite adapter"
+                },
+                {
+                    "id": "haystack-builder",
+                    "query": "haystack builder"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = zg()
+        .args(["dev", "bench", "sample-vault"])
+        .arg("--fixture")
+        .arg(&fixture)
+        .arg("--vault")
+        .arg(&root)
+        .arg("--fake-embeddings")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"fake_embeddings\": true"));
+    assert!(stdout.contains("\"level\": \"fts\""));
+    assert!(stdout.contains("\"level\": \"fts+vector\""));
+    assert!(stdout.contains("\"query_total_elapsed_ms\""));
 }
 
 #[test]

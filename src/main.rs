@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use zg::dev;
-use zg::index::{self, IndexStatus};
+use zg::index::{self, IndexLevel, IndexStatus};
 use zg::messages;
 use zg::search;
 use zg::{ZgResult, other};
@@ -65,6 +65,8 @@ enum Commands {
 #[derive(Debug, Subcommand, PartialEq)]
 enum IndexCommands {
     Init {
+        #[arg(long, value_enum, default_value_t = CliIndexLevel::Fts)]
+        level: CliIndexLevel,
         #[arg(value_name = "PATH", allow_hyphen_values = true)]
         path: Option<PathBuf>,
     },
@@ -73,6 +75,8 @@ enum IndexCommands {
         path: Option<PathBuf>,
     },
     Rebuild {
+        #[arg(long, value_enum)]
+        level: Option<CliIndexLevel>,
         #[arg(value_name = "PATH", allow_hyphen_values = true)]
         path: Option<PathBuf>,
     },
@@ -82,11 +86,32 @@ enum IndexCommands {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CliIndexLevel {
+    #[value(name = "fts")]
+    Fts,
+    #[value(name = "fts+vector")]
+    FtsVector,
+}
+
+impl From<CliIndexLevel> for IndexLevel {
+    fn from(value: CliIndexLevel) -> Self {
+        match value {
+            CliIndexLevel::Fts => IndexLevel::Fts,
+            CliIndexLevel::FtsVector => IndexLevel::FtsVector,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand, PartialEq)]
 enum DevCommands {
     SampleVault {
         #[command(subcommand)]
         command: SampleVaultCommands,
+    },
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommands,
     },
     Eval {
         #[command(subcommand)]
@@ -133,6 +158,30 @@ enum EvalCommands {
         vault: Option<PathBuf>,
         #[arg(long)]
         update_golden: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq)]
+enum BenchCommands {
+    SampleVault {
+        #[arg(
+            long,
+            value_name = "FIXTURE",
+            default_value = dev::DEFAULT_SEARCH_QUALITY_FIXTURE
+        )]
+        fixture: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        vault: Option<PathBuf>,
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        #[arg(long)]
+        fake_embeddings: bool,
+        #[arg(long)]
+        keep_scratch: bool,
         #[arg(long)]
         json: bool,
     },
@@ -214,10 +263,19 @@ fn run_cli(cli: Cli) -> ZgResult<()> {
 
 fn run_index_command(command: IndexCommands) -> ZgResult<()> {
     match command {
-        IndexCommands::Init { path } => {
+        IndexCommands::Init { level, path } => {
             let root = resolve_dir_arg(path.as_deref())?;
-            let stats = index::init_index(&root)?;
-            println!("{}", messages::initialized_index(&root, &stats));
+            let index_level = IndexLevel::from(level);
+            let stats = index::init_index_with_level(&root, index_level)?;
+            println!(
+                "{}",
+                messages::initialized_index(&root, index_level, &stats)
+            );
+            if let Some(note) =
+                messages::index_level_follow_up(&root, index_level, stats.chunks_indexed)
+            {
+                println!("{note}");
+            }
             if let Some(note) = index::best_effort_overlap_note(&root)? {
                 println!("{note}");
             }
@@ -229,10 +287,20 @@ fn run_index_command(command: IndexCommands) -> ZgResult<()> {
             print_status(&status);
             Ok(())
         }
-        IndexCommands::Rebuild { path } => {
+        IndexCommands::Rebuild { level, path } => {
             let root = resolve_dir_arg(path.as_deref())?;
-            let stats = index::rebuild_index(&root)?;
-            println!("{}", messages::rebuilt_index(&root, &stats));
+            let index_level = level.map(IndexLevel::from);
+            let stats = index::rebuild_index_with_level(&root, index_level)?;
+            let status = index::load_status(&root)?;
+            println!(
+                "{}",
+                messages::rebuilt_index(&root, status.index_level, &stats)
+            );
+            if let Some(note) =
+                messages::index_level_follow_up(&root, status.index_level, stats.chunks_indexed)
+            {
+                println!("{note}");
+            }
             Ok(())
         }
         IndexCommands::Delete { path } => {
@@ -266,6 +334,34 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
                         ensured.path.display(),
                         ensured.commit
                     );
+                }
+                Ok(())
+            }
+        },
+        DevCommands::Bench { command } => match command {
+            BenchCommands::SampleVault {
+                fixture,
+                vault,
+                out,
+                repeat,
+                fake_embeddings,
+                keep_scratch,
+                json,
+            } => {
+                let exe_path = std::env::current_exe()?;
+                let report = dev::run_sample_vault_benchmark(
+                    &exe_path,
+                    &fixture,
+                    vault.as_deref(),
+                    fake_embeddings,
+                    repeat,
+                    keep_scratch,
+                    out.as_deref(),
+                )?;
+                if json {
+                    print_json(&report)?;
+                } else {
+                    print!("{}", format_sample_vault_benchmark(&report));
                 }
                 Ok(())
             }
@@ -343,16 +439,9 @@ fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
     match resolve_search_mode(query) {
         SearchMode::Regex => run_grep(query, Some(&requested)),
         SearchMode::Indexed => {
-            let (root, init_stats) = index::ensure_index_root_for_search(&requested)?;
-            if let Some(stats) = init_stats {
-                eprintln!("{}", messages::implicit_init_note(&root, &stats));
-                eprintln!("{}", messages::cache_delete_note(&root));
-                if let Some(note) = index::best_effort_overlap_note(&root)? {
-                    eprintln!("{note}");
-                }
-            }
+            let root = index::require_index_root_for_search(&requested)?;
             index::reconcile_covering_roots(&requested)?;
-            let hits = index::search_hybrid(&root, &requested, query, 20)?;
+            let hits = index::search_indexed(&root, &requested, query, 20)?;
             for hit in hits {
                 println!(
                     "{}",
@@ -430,6 +519,7 @@ fn format_status(status: &IndexStatus) -> String {
             .unwrap_or_else(|| "none".to_string())
     ));
     lines.push(format!("indexed: {}", yes_no(status.indexed)));
+    lines.push(format!("index level: {}", status.index_level));
     lines.push(format!("chunking: {}", status.chunk_mode));
     lines.push(format!("marker: {}", status.chunk_marker));
     lines.push(format!("scope policy: {}", status.scope_policy));
@@ -446,6 +536,18 @@ fn format_status(status: &IndexStatus) -> String {
     lines.push(format!("chunks: {}", status.chunk_count));
     lines.push(format!("fts ready: {}", yes_no(status.fts_ready)));
     lines.push(format!("vector ready: {}", yes_no(status.vector_ready)));
+    if let Some(last_status) = &status.last_index_run_status {
+        lines.push(format!("last index run status: {}", last_status));
+    }
+    if let Some(duration_ms) = status.last_index_run_duration_ms {
+        lines.push(format!("last index run duration ms: {}", duration_ms));
+    }
+    if let Some(root) = &status.index_root {
+        if let Some(hint) = messages::status_level_hint(root, status.index_level, status.chunk_count)
+        {
+            lines.push(hint);
+        }
+    }
     lines.push(format!(
         "last sync unix ms: {}",
         status
@@ -465,10 +567,7 @@ fn format_search_quality_report(report: &dev::SearchQualityReport) -> String {
         report.total_cases,
         report.vault_root.display()
     ));
-    lines.push(format!(
-        "fixture: {}",
-        report.fixture_path.display()
-    ));
+    lines.push(format!("fixture: {}", report.fixture_path.display()));
     if let Some(golden_path) = &report.golden_path {
         lines.push(format!("golden: {}", golden_path.display()));
     }
@@ -515,6 +614,43 @@ fn format_search_quality_report(report: &dev::SearchQualityReport) -> String {
     lines.join("\n") + "\n"
 }
 
+fn format_sample_vault_benchmark(report: &dev::SampleVaultBenchmarkReport) -> String {
+    let mut lines = vec![
+        format!("fixture: {}", report.fixture_path.display()),
+        format!("source vault: {}", report.source_vault.display()),
+        format!("fake embeddings: {}", yes_no(report.fake_embeddings)),
+        format!("repeat: {}", report.repeat),
+    ];
+    if !report.scratch_root.as_os_str().is_empty() {
+        lines.push(format!("scratch root: {}", report.scratch_root.display()));
+    }
+
+    for level in &report.levels {
+        lines.push(String::new());
+        lines.push(format!("[{}]", level.level));
+        lines.push(format!("init ms: {}", level.init_elapsed_ms));
+        lines.push(format!(
+            "status: files={} chunks={}",
+            level.status_file_count, level.status_chunk_count
+        ));
+        lines.push(format!(
+            "queries: total={}ms mean={}ms p50={}ms p95={}ms",
+            level.query_total_elapsed_ms,
+            level.query_mean_elapsed_ms,
+            level.query_p50_elapsed_ms,
+            level.query_p95_elapsed_ms
+        ));
+        for case in &level.cases {
+            lines.push(format!(
+                "  {}#{} {}ms lines={} {}",
+                case.id, case.repeat_index, case.elapsed_ms, case.stdout_lines, case.query
+            ));
+        }
+    }
+
+    lines.join("\n") + "\n"
+}
+
 fn format_chunk_probe(report: &dev::ChunkProbeReport) -> String {
     let mut lines = Vec::new();
     lines.push(format!("path: {}", report.path.display()));
@@ -540,7 +676,10 @@ fn format_chunk_probe(report: &dev::ChunkProbeReport) -> String {
             "shared normalized: {:?}",
             chunk.shared_normalized_text
         ));
-        lines.push(format!("shared hash: {}", chunk.shared_normalized_text_hash));
+        lines.push(format!(
+            "shared hash: {}",
+            chunk.shared_normalized_text_hash
+        ));
     }
     lines.join("\n") + "\n"
 }
@@ -593,7 +732,10 @@ fn format_db_cache_probe(report: &dev::DbCacheProbeReport) -> String {
     if let Some(last_run) = &report.last_index_run {
         lines.push(format!(
             "last index run: {} [{} indexed / {} scanned / {} chunks]",
-            last_run.status, last_run.indexed_files, last_run.scanned_files, last_run.chunks_indexed
+            last_run.status,
+            last_run.indexed_files,
+            last_run.scanned_files,
+            last_run.chunks_indexed
         ));
         if let Some(error) = &last_run.error {
             lines.push(format!("last index run error: {}", error));
@@ -624,7 +766,7 @@ mod tests {
         Cli, Commands, IndexCommands, SearchMode, format_search_result, format_status,
         parse_cli_from, resolve_search_mode,
     };
-    use zg::index;
+    use zg::index::{self, IndexLevel};
     use zg::messages;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -666,8 +808,7 @@ mod tests {
         fs::write(root.join("alpha.txt"), "sqlite vector adapter").unwrap();
 
         // CLI dispatch is intentionally simple: non-regex input enters the indexed-search
-        // pipeline, which then reuses the nearest ancestor .zg or creates one for the
-        // directory search scope before reconcile/embed work runs.
+        // pipeline. Whether a usable explicit index exists is checked later in run_search.
         let mode = resolve_search_mode("sqlite vector");
         assert_eq!(mode, SearchMode::Indexed);
     }
@@ -704,26 +845,82 @@ mod tests {
         let status = index::load_status(&root).unwrap();
 
         let rendered = format_status(&status);
+        assert!(rendered.contains("index level: fts"));
         assert!(rendered.contains("walk policy: ripgrep-style:"));
         assert!(rendered.contains(".zgignore"));
         assert!(rendered.contains(".zg/ always skipped"));
     }
 
     #[test]
-    fn implicit_init_note_mentions_delete_command() {
+    fn formatted_status_includes_last_index_run_when_present() {
+        let root = temp_dir("status-last-run");
+        fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+        index::init_index(&root).unwrap();
+
+        let status = index::load_status(&root).unwrap();
+        let rendered = format_status(&status);
+        assert!(rendered.contains("last index run status:"));
+        assert!(rendered.contains("last index run duration ms:"));
+    }
+
+    #[test]
+    fn explicit_index_required_message_mentions_both_levels() {
         let root = temp_dir("implicit-note");
+        let rendered = messages::explicit_index_required_error(&root, 32, true, true);
+
+        assert!(rendered.contains("no ancestor .zg index found"));
+        assert!(rendered.contains("estimated chunks: 32"));
+        assert!(rendered.contains("quick path: `zg index init --level fts"));
+        assert!(rendered.contains("semantic path: `zg index init --level fts+vector"));
+        assert!(rendered.contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn large_missing_index_message_does_not_upsell_vector() {
+        let root = temp_dir("implicit-large");
+        let rendered = messages::explicit_index_required_error(&root, 5000, false, false);
+
+        assert!(rendered.contains("run `zg index init"));
+        assert!(!rendered.contains("semantic path:"));
+    }
+
+    #[test]
+    fn status_hint_shows_upgrade_for_small_fts_indexes() {
+        let root = temp_dir("status-hint");
+        let mut status = index::load_status(&root).unwrap();
+        status.index_root = Some(root.clone());
+        status.index_level = IndexLevel::Fts;
+        status.chunk_count = 128;
+
+        let rendered = format_status(&status);
+        assert!(rendered.contains("upgrade hint: `zg index rebuild --level fts+vector"));
+    }
+
+    #[test]
+    fn init_subcommand_accepts_vector_level() {
+        let cli = parse_cli_from(["zg", "index", "init", "--level", "fts+vector", "docs"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Index {
+                command: IndexCommands::Init {
+                    level: super::CliIndexLevel::FtsVector,
+                    path: Some(PathBuf::from("docs")),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn rebuilt_message_includes_level() {
+        let root = temp_dir("rebuild-note");
         let stats = index::RebuildStats {
             scanned_files: 3,
             indexed_files: 2,
             chunks_indexed: 7,
         };
 
-        let init_note = messages::implicit_init_note(&root, &stats);
-        let delete_note = messages::cache_delete_note(&root);
-
-        assert!(init_note.contains("initialized local cache"));
-        assert!(delete_note.contains("zg index delete"));
-        assert!(delete_note.contains(&root.display().to_string()));
+        let rendered = messages::rebuilt_index(&root, IndexLevel::FtsVector, &stats);
+        assert!(rendered.contains("level=fts+vector"));
     }
 
     #[test]

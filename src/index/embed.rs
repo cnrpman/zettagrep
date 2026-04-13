@@ -1,5 +1,11 @@
 #[cfg(not(test))]
 use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock as TestOnceLock};
+#[cfg(test)]
+use std::thread::ThreadId;
 
 #[cfg(not(test))]
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
@@ -9,6 +15,13 @@ use crate::{ZgResult, other};
 
 #[cfg(not(test))]
 static TEXT_EMBEDDER: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
+const DEFAULT_FASTEMBED_BATCH_SIZE: usize = 64;
+#[cfg(test)]
+static EMBED_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static EMBED_TEXTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static EMBED_CAPTURE_THREAD: TestOnceLock<Mutex<Option<ThreadId>>> = TestOnceLock::new();
 
 pub(crate) fn embed_passages(texts: &[String]) -> ZgResult<Vec<Vec<f32>>> {
     embed(texts, "passage")
@@ -24,6 +37,20 @@ pub(crate) fn embed_query(text: &str) -> ZgResult<Vec<f32>> {
 fn embed(texts: &[String], prefix: &str) -> ZgResult<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
+    }
+
+    #[cfg(test)]
+    {
+        let current = std::thread::current().id();
+        if embed_capture_thread()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .is_some_and(|thread_id| thread_id == current)
+        {
+            EMBED_CALLS.fetch_add(1, Ordering::Relaxed);
+            EMBED_TEXTS.fetch_add(texts.len(), Ordering::Relaxed);
+        }
     }
 
     let prefixed = texts
@@ -44,7 +71,7 @@ fn embed(texts: &[String], prefix: &str) -> ZgResult<Vec<Vec<f32>>> {
             .lock()
             .map_err(|_| other("fastembed model lock poisoned"))?;
         #[cfg(not(test))]
-        let embeddings = guard.embed(prefixed, None)?;
+        let embeddings = guard.embed(prefixed, Some(configured_fastembed_batch_size()))?;
 
         #[cfg(not(test))]
         {
@@ -83,6 +110,8 @@ fn embedder() -> ZgResult<&'static Mutex<TextEmbedding>> {
 
 #[cfg(not(test))]
 fn build_embedder() -> ZgResult<TextEmbedding> {
+    // fastembed's public TextInitOptions exposes model/cache/provider knobs, but not
+    // ONNX Runtime intra-thread control; try_new currently chooses available_parallelism().
     TextEmbedding::try_new(TextInitOptions::new(
         EmbeddingModel::ParaphraseMLMiniLML12V2Q,
     ))
@@ -91,6 +120,7 @@ fn build_embedder() -> ZgResult<TextEmbedding> {
 #[cfg(not(test))]
 fn fastembed_env_summary() -> String {
     let keys = [
+        "ZG_FASTEMBED_BATCH_SIZE",
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
@@ -125,4 +155,82 @@ fn deterministic_embedding(text: &str) -> Vec<f32> {
         vector[slot] += f32::from(byte % 31) + 1.0;
     }
     vector
+}
+
+fn configured_fastembed_batch_size() -> usize {
+    std::env::var("ZG_FASTEMBED_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FASTEMBED_BATCH_SIZE)
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_embed_counters() {
+    EMBED_CALLS.store(0, Ordering::Relaxed);
+    EMBED_TEXTS.store(0, Ordering::Relaxed);
+    if let Ok(mut guard) = embed_capture_thread().lock() {
+        *guard = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_begin_embed_capture_for_current_thread() {
+    test_reset_embed_counters();
+    if let Ok(mut guard) = embed_capture_thread().lock() {
+        *guard = Some(std::thread::current().id());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_embed_counters() -> (usize, usize) {
+    (
+        EMBED_CALLS.load(Ordering::Relaxed),
+        EMBED_TEXTS.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+fn embed_capture_thread() -> &'static Mutex<Option<ThreadId>> {
+    EMBED_CAPTURE_THREAD.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_FASTEMBED_BATCH_SIZE, configured_fastembed_batch_size, test_begin_embed_capture_for_current_thread,
+        test_embed_counters, test_reset_embed_counters,
+    };
+
+    #[test]
+    fn batch_size_defaults_to_fastembed_default() {
+        unsafe {
+            std::env::remove_var("ZG_FASTEMBED_BATCH_SIZE");
+        }
+        assert_eq!(configured_fastembed_batch_size(), DEFAULT_FASTEMBED_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_size_can_be_overridden_by_env() {
+        unsafe {
+            std::env::set_var("ZG_FASTEMBED_BATCH_SIZE", "64");
+        }
+        assert_eq!(configured_fastembed_batch_size(), 64);
+        unsafe {
+            std::env::remove_var("ZG_FASTEMBED_BATCH_SIZE");
+        }
+    }
+
+    #[test]
+    fn test_counters_reset_cleanly() {
+        test_reset_embed_counters();
+        assert_eq!(test_embed_counters(), (0, 0));
+    }
+
+    #[test]
+    fn capture_is_thread_scoped() {
+        test_begin_embed_capture_for_current_thread();
+        assert_eq!(test_embed_counters(), (0, 0));
+        test_reset_embed_counters();
+    }
 }

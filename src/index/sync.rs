@@ -10,43 +10,38 @@ use crate::paths;
 
 use super::db::{
     create_schema, delete_by_rel_path, ensure_index_root, gc_unreferenced_shared_chunks,
-    load_file_rows_for_scope, load_state, load_state_mirror_status, mark_dirty, open_existing_db,
-    open_or_create_db, prepare_shared_chunk_vectors, reset_schema, seed_defaults, set_dirty_state,
-    status_for_index_root, upsert_document, validate_schema, write_state_mirror,
+    load_file_rows_for_scope, load_index_level, load_state, load_state_mirror_status, mark_dirty,
+    open_existing_db, open_or_create_db, prepare_missing_shared_chunk_vectors, reset_schema,
+    seed_defaults, set_dirty_state, set_index_level, status_for_index_root, upsert_document, validate_schema,
+    with_write_transaction_retry, write_state_mirror,
 };
 use super::files::{
-    collect_candidate_files, collect_scope_candidates, load_indexable_document,
-    scan_candidate_files_until,
+    collect_candidate_files, collect_scope_candidates, estimate_indexable_chunks,
+    load_indexable_documents,
 };
-use super::types::{IndexStatus, IndexedDocument, RebuildStats, StateRow, SyncStats};
+use super::types::{
+    DEFAULT_INDEX_LEVEL, FTS_PROMPT_MAX_CHUNKS, IndexLevel, IndexStatus, IndexedDocument,
+    RebuildStats, StateRow, SyncStats, VECTOR_PROMPT_MAX_CHUNKS,
+};
 use super::util::{
     ancestor_index_root, descendant_index_root, modified_unix_ms, now_unix_ms, relative_path_string,
 };
 
-const IMPLICIT_INIT_MAX_FILES: usize = 2000;
-const IMPLICIT_INIT_MAX_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
-const PROTECTED_HOME_DIR_NAMES: &[&str] = &[
-    "Desktop",
-    "Documents",
-    "Downloads",
-    "Music",
-    "Pictures",
-    "Public",
-    "Templates",
-    "Videos",
-    "Movies",
-];
-
 pub fn init_index(root: &Path) -> ZgResult<RebuildStats> {
+    init_index_with_level(root, DEFAULT_INDEX_LEVEL)
+}
+
+pub fn init_index_with_level(root: &Path, index_level: IndexLevel) -> ZgResult<RebuildStats> {
     let root = paths::resolve_existing_dir(root)?;
     paths::ensure_hidden_dir(&root)?;
 
     let conn = open_or_create_db(&root)?;
     create_schema(&conn)?;
     seed_defaults(&conn)?;
+    set_index_level(&conn, index_level)?;
     write_state_mirror(&root, &status_for_index_root(&root)?)?;
 
-    rebuild_index(&root)
+    rebuild_index_with_level(&root, Some(index_level))
 }
 
 pub fn delete_index(root: &Path) -> ZgResult<bool> {
@@ -66,45 +61,66 @@ pub fn delete_index(root: &Path) -> ZgResult<bool> {
     Ok(true)
 }
 
-pub fn ensure_index_root_for_search(scope: &Path) -> ZgResult<(PathBuf, Option<RebuildStats>)> {
+pub fn require_index_root_for_search(scope: &Path) -> ZgResult<PathBuf> {
     let scope = paths::resolve_existing_path(scope)?;
     if let Some(root) = paths::find_index_root(&scope) {
-        return Ok((root, None));
+        return Ok(root);
     }
 
     let root = if scope.is_dir() {
         scope
     } else {
-        scope.parent().map(Path::to_path_buf).ok_or_else(|| {
-            crate::other("cannot determine directory index root for search-triggered creation")
-        })?
+        scope
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| crate::other("cannot determine directory index root for search"))?
     };
-
-    ensure_safe_implicit_init_root(&root)?;
-    let stats = init_index(&root)?;
-    Ok((root, Some(stats)))
+    let estimate = estimate_indexable_chunks(&root)?;
+    Err(crate::other(messages::explicit_index_required_error(
+        &root,
+        estimate.chunk_count,
+        estimate.chunk_count <= FTS_PROMPT_MAX_CHUNKS,
+        estimate.chunk_count <= VECTOR_PROMPT_MAX_CHUNKS,
+    )))
 }
 
 pub fn rebuild_index(root: &Path) -> ZgResult<RebuildStats> {
+    rebuild_index_with_level(root, None)
+}
+
+pub fn rebuild_index_with_level(
+    root: &Path,
+    index_level_override: Option<IndexLevel>,
+) -> ZgResult<RebuildStats> {
     let root = paths::resolve_existing_dir(root)?;
     ensure_index_root(&root)?;
 
     let conn = open_or_create_db(&root)?;
+    let retained_index_level = if index_level_override.is_none() {
+        load_index_level(&conn).ok()
+    } else {
+        None
+    };
     if validate_schema(&conn).is_err() {
         reset_schema(&conn)?;
     }
     create_schema(&conn)?;
     seed_defaults(&conn)?;
+    if let Some(index_level) = index_level_override.or(retained_index_level) {
+        set_index_level(&conn, index_level)?;
+    }
+    let index_level = load_index_level(&conn)?;
 
     let started_at = now_unix_ms();
     let candidate_files = collect_candidate_files(&root)?;
+    let loaded_documents = load_indexable_documents(&candidate_files)?;
     let mut pending_upserts = Vec::new();
     let mut indexed_files = 0usize;
     let mut chunks_indexed = 0usize;
     let mut warnings = Vec::new();
 
-    for path in &candidate_files {
-        match load_indexable_document(path)? {
+    for (path, document) in candidate_files.iter().zip(loaded_documents.into_iter()) {
+        match document {
             Some(document) => {
                 let rel_path = relative_path_string(&root, path)?;
                 chunks_indexed += document.chunks.len();
@@ -115,60 +131,66 @@ pub fn rebuild_index(root: &Path) -> ZgResult<RebuildStats> {
         }
     }
 
-    let prepared_vectors = prepare_shared_chunk_vectors(
-        &pending_upserts
-            .iter()
-            .map(|pending| &pending.document)
-            .collect::<Vec<_>>(),
-    )?;
-    let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM fts_chunks", [])?;
-    tx.execute("DELETE FROM chunk_refs", [])?;
-    tx.execute("DELETE FROM files", [])?;
-    tx.execute("DELETE FROM vec_index", [])?;
-    tx.execute("DELETE FROM vec_chunks", [])?;
-    tx.execute("DELETE FROM shared_chunks", [])?;
-
-    for pending in &pending_upserts {
-        upsert_document(
-            &tx,
-            &pending.rel_path,
-            &pending.document,
-            Some(&prepared_vectors),
+    // Hold the writer lock before any embedding work so concurrent zg processes do
+    // not race to compute the same missing vectors for the same root.
+    with_write_transaction_retry(&conn, &root, "rebuilding index at", |tx| {
+        tx.execute("DELETE FROM fts_chunks", [])?;
+        tx.execute("DELETE FROM chunk_refs", [])?;
+        tx.execute("DELETE FROM files", [])?;
+        tx.execute("DELETE FROM vec_index", [])?;
+        tx.execute("DELETE FROM vec_chunks", [])?;
+        tx.execute("DELETE FROM shared_chunks", [])?;
+        let prepared_vectors = prepare_missing_shared_chunk_vectors(
+            tx,
+            &pending_upserts
+                .iter()
+                .map(|pending| &pending.document)
+                .collect::<Vec<_>>(),
+            index_level.vectors_enabled(),
         )?;
-    }
 
-    tx.execute(
-        "INSERT INTO index_runs (
-            started_at_unix_ms,
-            finished_at_unix_ms,
-            status,
-            scanned_files,
-            indexed_files,
-            chunks_indexed,
-            error
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            started_at as i64,
-            now_unix_ms() as i64,
-            if warnings.is_empty() {
-                "completed"
-            } else {
-                "completed_with_warnings"
-            },
-            candidate_files.len() as i64,
-            indexed_files as i64,
-            chunks_indexed as i64,
-            warnings.first().cloned(),
-        ],
-    )?;
-    set_dirty_state(
-        &tx,
-        !warnings.is_empty(),
-        warnings.first().map(String::as_str),
-        Some(now_unix_ms()),
-    )?;
-    tx.commit()?;
+        for pending in &pending_upserts {
+            upsert_document(
+                tx,
+                &pending.rel_path,
+                &pending.document,
+                Some(&prepared_vectors),
+                index_level.vectors_enabled(),
+            )?;
+        }
+
+        tx.execute(
+            "INSERT INTO index_runs (
+                started_at_unix_ms,
+                finished_at_unix_ms,
+                status,
+                scanned_files,
+                indexed_files,
+                chunks_indexed,
+                error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                started_at as i64,
+                now_unix_ms() as i64,
+                if warnings.is_empty() {
+                    "completed"
+                } else {
+                    "completed_with_warnings"
+                },
+                candidate_files.len() as i64,
+                indexed_files as i64,
+                chunks_indexed as i64,
+                warnings.first().cloned(),
+            ],
+        )?;
+        set_dirty_state(
+            tx,
+            !warnings.is_empty(),
+            warnings.first().map(String::as_str),
+            Some(now_unix_ms()),
+        )?;
+        Ok(())
+    })?;
 
     write_state_mirror(&root, &status_for_index_root(&root)?)?;
 
@@ -251,12 +273,15 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
     validate_schema(&conn)?;
 
     let existing = load_file_rows_for_scope(&conn, &root, &scope)?;
+    let index_level = load_index_level(&conn)?;
     let current_state = load_state(&conn)?.unwrap_or(StateRow {
         dirty: false,
         dirty_reason: None,
         last_sync_unix_ms: None,
     });
     let candidate_files = collect_scope_candidates(&root, &scope)?;
+    let mut dirty_paths = Vec::new();
+    let mut dirty_rel_paths = Vec::new();
     let mut seen = HashSet::new();
     let mut pending_upserts = Vec::new();
     let mut pending_deletes = Vec::new();
@@ -280,7 +305,17 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
             continue;
         }
 
-        match load_indexable_document(&path)? {
+        dirty_rel_paths.push(rel_path);
+        dirty_paths.push(path);
+    }
+
+    let loaded_documents = load_indexable_documents(&dirty_paths)?;
+    for ((rel_path, path), document) in dirty_rel_paths
+        .into_iter()
+        .zip(dirty_paths.into_iter())
+        .zip(loaded_documents.into_iter())
+    {
+        match document {
             Some(document) => {
                 stats.indexed_files += 1;
                 stats.chunks_indexed += document.chunks.len();
@@ -308,35 +343,42 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
         current_state.dirty != desired_dirty || current_state.dirty_reason != desired_reason;
 
     if !pending_upserts.is_empty() || !pending_deletes.is_empty() || needs_state_write {
-        let prepared_vectors = prepare_shared_chunk_vectors(
-            &pending_upserts
-                .iter()
-                .map(|pending| &pending.document)
-                .collect::<Vec<_>>(),
-        )?;
-        let tx = conn.unchecked_transaction()?;
-        for pending in &pending_upserts {
-            upsert_document(
-                &tx,
-                &pending.rel_path,
-                &pending.document,
-                Some(&prepared_vectors),
+        // Take the writer lock before embedding so a second zg process waits and
+        // then reuses shared vectors written by the first writer instead of
+        // recomputing them eagerly.
+        with_write_transaction_retry(&conn, &root, "reconciling index scope at", |tx| {
+            let prepared_vectors = prepare_missing_shared_chunk_vectors(
+                tx,
+                &pending_upserts
+                    .iter()
+                    .map(|pending| &pending.document)
+                    .collect::<Vec<_>>(),
+                index_level.vectors_enabled(),
             )?;
-        }
-        for rel_path in &pending_deletes {
-            delete_by_rel_path(&tx, rel_path)?;
-        }
-        if !pending_upserts.is_empty() || !pending_deletes.is_empty() {
-            gc_unreferenced_shared_chunks(&tx)?;
-        }
+            for pending in &pending_upserts {
+                upsert_document(
+                    tx,
+                    &pending.rel_path,
+                    &pending.document,
+                    Some(&prepared_vectors),
+                    index_level.vectors_enabled(),
+                )?;
+            }
+            for rel_path in &pending_deletes {
+                delete_by_rel_path(tx, rel_path)?;
+            }
+            if !pending_upserts.is_empty() || !pending_deletes.is_empty() {
+                gc_unreferenced_shared_chunks(tx)?;
+            }
 
-        set_dirty_state(
-            &tx,
-            desired_dirty,
-            desired_reason.as_deref(),
-            Some(now_unix_ms()),
-        )?;
-        tx.commit()?;
+            set_dirty_state(
+                tx,
+                desired_dirty,
+                desired_reason.as_deref(),
+                Some(now_unix_ms()),
+            )?;
+            Ok(())
+        })?;
     }
 
     write_state_mirror(&root, &status_for_index_root(&root)?)?;
@@ -348,87 +390,21 @@ struct PendingDocument {
     document: IndexedDocument,
 }
 
-fn ensure_safe_implicit_init_root(root: &Path) -> ZgResult<()> {
-    if let Some(reason) = protected_implicit_root_reason(root, home_dir()) {
-        return Err(crate::other(format_protected_root_refusal(root, reason)));
-    }
-
-    let summary =
-        scan_candidate_files_until(root, IMPLICIT_INIT_MAX_FILES, IMPLICIT_INIT_MAX_TOTAL_BYTES)?;
-    if summary.limit_tripped {
-        return Err(crate::other(format_threshold_refusal(
-            root,
-            summary.candidate_files,
-            summary.total_size_bytes,
-        )));
-    }
-
-    Ok(())
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-fn protected_implicit_root_reason(root: &Path, home: Option<PathBuf>) -> Option<&'static str> {
-    if root == Path::new("/") {
-        return Some("filesystem root");
-    }
-
-    let home = home?;
-    if root == home {
-        return Some("home directory");
-    }
-    if PROTECTED_HOME_DIR_NAMES
-        .iter()
-        .map(|name| home.join(name))
-        .any(|dir| dir == root)
-    {
-        return Some("user content directory");
-    }
-
-    None
-}
-
-fn format_threshold_refusal(root: &Path, files: usize, total_size_bytes: u64) -> String {
-    messages::threshold_refusal(root, files, total_size_bytes)
-}
-
-fn format_protected_root_refusal(root: &Path, reason: &str) -> String {
-    messages::protected_root_refusal(root, reason)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{format_protected_root_refusal, protected_implicit_root_reason};
+    use super::require_index_root_for_search;
     use crate::messages;
 
     #[test]
-    fn protected_root_reason_matches_home_and_documents() {
-        let home = PathBuf::from("/tmp/zg-home");
-        assert_eq!(
-            protected_implicit_root_reason(&home, Some(home.clone())),
-            Some("home directory")
-        );
-        assert_eq!(
-            protected_implicit_root_reason(&home.join("Documents"), Some(home.clone())),
-            Some("user content directory")
-        );
-        assert_eq!(
-            protected_implicit_root_reason(&home.join("project"), Some(home)),
-            None
-        );
-    }
-
-    #[test]
-    fn protected_root_refusal_is_actionable() {
-        let root = PathBuf::from("/tmp/zg-home/Documents");
-        let rendered = format_protected_root_refusal(&root, "user content directory");
-        assert!(rendered.contains("zg: refusing to auto-create index"));
-        assert!(rendered.contains("zg index init"));
-        assert!(rendered.contains("user content directory"));
+    fn missing_index_error_is_actionable() {
+        let root = PathBuf::from("/tmp/zg-project");
+        let rendered = messages::explicit_index_required_error(&root, 64, true, true);
+        assert!(rendered.contains("zg: no ancestor .zg index found"));
+        assert!(rendered.contains("estimated chunks: 64"));
+        assert!(rendered.contains("quick path: `zg index init --level fts"));
+        assert!(rendered.contains("semantic path: `zg index init --level fts+vector"));
     }
 
     #[test]
@@ -436,5 +412,18 @@ mod tests {
         let root = PathBuf::from("/tmp/zg-root");
         assert!(messages::schema_rebuild_required_error(&root).contains("zg index rebuild"));
         assert!(messages::schema_rebuild_dirty_reason(&root).contains("zg index rebuild"));
+    }
+
+    #[test]
+    fn require_index_root_for_search_reports_missing_root() {
+        let root = std::env::temp_dir().join("zg-missing-index-root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let error = require_index_root_for_search(&root).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("zg: no ancestor .zg index found")
+        );
     }
 }

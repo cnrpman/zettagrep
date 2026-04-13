@@ -81,17 +81,31 @@ FTS / BM25 必须保留 occurrence。
 1. 对 dirty/new file 重新 chunk
 2. 对每个 chunk 计算 `normalized_text`
 3. 对 `normalized_text` 计算 hash
-4. 以 `(hash, normalized_text)` 查 `shared_chunks`
-5. 未命中的 normalized text 批量 embedding，一次写入 `shared_chunks` + `vec_*`
-6. 写新的 `chunk_refs`
-7. 删除旧 `chunk_refs`
-8. 最后统一 GC `ref_count = 0` 的 `shared_chunks`
+4. 获取同一个 `.zg` 根的 writer lock
+5. 在 writer lock 内以 `(hash, normalized_text)` 查最新的 `shared_chunks`
+6. 只对仍未命中的 normalized text 批量 embedding，并写入 `shared_chunks` + `vec_*`
+7. 写新的 `chunk_refs`
+8. 删除旧 `chunk_refs`
+9. 最后统一 GC `ref_count = 0` 的 `shared_chunks`
 
 关键点：
 
 - hash 必须对 `normalized_text` 算
 - 一次 reconcile 批次里，相同 normalized text 只 embed 一次
+- 并发 `zg` 命中同一个 `.zg` 根时，第二个 writer 必须等锁，而不是在锁外先重复 embed
 - GC 必须放在 transaction 末尾
+
+## Concurrency Rule
+
+同一个 `.zg` 根内，shared embedding 的缺失判定必须发生在 writer lock 内。
+
+原因是：
+
+- 如果先在锁外判断 missing，再去 embed，两个 `zg` 可能对同一批缺失文本重复计算
+- 正确行为是第二个 `zg` 先等待第一个 writer 提交
+- 等第一个 writer 提交后，第二个 `zg` 再读 `shared_chunks`，通常会直接复用已有 embedding
+
+等待 writer lock 最长可以持续 `900s`，因为本地 embedding 本身可能是长操作。
 
 ## Why GC Must Be Deferred
 

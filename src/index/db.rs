@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::auto_extension::{RawAutoExtension, register_auto_extension};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::ffi::ErrorCode;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sqlite_vec::sqlite3_vec_init;
 
 use crate::messages::INDEX_SCHEMA_VERSION_MISMATCH;
@@ -15,13 +16,15 @@ use crate::{ZgResult, other};
 
 use super::embed::embed_passages;
 use super::types::{
-    DEFAULT_CHUNK_MARKER, DEFAULT_CHUNK_MODE, DEFAULT_SCOPE_POLICY, DEFAULT_VECTOR_PROVIDER,
-    FileRecord, IndexStatus, IndexedDocument, SCHEMA_VERSION, ScopeKind, StateMirror, StateRow,
-    VECTOR_DIMENSIONS,
+    DEFAULT_CHUNK_MARKER, DEFAULT_CHUNK_MODE, DEFAULT_INDEX_LEVEL, DEFAULT_SCOPE_POLICY,
+    DEFAULT_VECTOR_PROVIDER, FileRecord, IndexLevel, IndexStatus, IndexedDocument, SCHEMA_VERSION,
+    ScopeKind, StateMirror, StateRow, VECTOR_DIMENSIONS,
 };
 use super::util::{now_unix_ms, scope_kind};
 
 static SQLITE_VEC_REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+const WRITE_TX_MAX_WAIT: Duration = Duration::from_secs(900);
+const WRITE_TX_RETRY_DELAY_CAP: Duration = Duration::from_secs(5);
 
 pub(crate) fn open_or_create_db(root: &Path) -> ZgResult<Connection> {
     ensure_sqlite_vec_registered()?;
@@ -58,6 +61,58 @@ pub(crate) fn open_existing_db(root: &Path) -> ZgResult<Connection> {
     open_or_create_db(root)
 }
 
+pub(crate) fn with_write_transaction_retry<T, F>(
+    conn: &Connection,
+    root: &Path,
+    operation: &str,
+    mut work: F,
+) -> ZgResult<T>
+where
+    F: FnMut(&rusqlite::Transaction<'_>) -> ZgResult<T>,
+{
+    let started_at = Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        let tx = match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(error) if is_sqlite_busy_or_locked_rusqlite(&error) => {
+                if let Some(delay) = retry_delay(started_at, attempt) {
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                    continue;
+                }
+                return Err(write_lock_retry_exhausted(root, operation, error.into()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        match work(&tx) {
+            Ok(result) => match tx.commit() {
+                Ok(()) => return Ok(result),
+                Err(error) if is_sqlite_busy_or_locked_rusqlite(&error) => {
+                    if let Some(delay) = retry_delay(started_at, attempt) {
+                        std::thread::sleep(delay);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(write_lock_retry_exhausted(root, operation, error.into()));
+                }
+                Err(error) => return Err(error.into()),
+            },
+            Err(error) if is_sqlite_busy_or_locked(&error) => {
+                drop(tx);
+                if let Some(delay) = retry_delay(started_at, attempt) {
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                    continue;
+                }
+                return Err(write_lock_retry_exhausted(root, operation, error));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(crate) fn ensure_index_root(root: &Path) -> ZgResult<()> {
     if paths::is_indexed_root(root) {
         return Ok(());
@@ -66,6 +121,47 @@ pub(crate) fn ensure_index_root(root: &Path) -> ZgResult<()> {
         "{} is not an indexed zg root",
         root.display()
     )))
+}
+
+fn retry_delay(started_at: Instant, attempt: u32) -> Option<Duration> {
+    let elapsed = started_at.elapsed();
+    let remaining = WRITE_TX_MAX_WAIT.checked_sub(elapsed)?;
+    let backoff_ms = 200u64.saturating_mul(1u64 << attempt.min(5));
+    Some(
+        Duration::from_millis(backoff_ms)
+            .min(WRITE_TX_RETRY_DELAY_CAP)
+            .min(remaining),
+    )
+}
+
+fn is_sqlite_busy_or_locked(error: &crate::DynError) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(is_sqlite_busy_or_locked_rusqlite)
+}
+
+fn is_sqlite_busy_or_locked_rusqlite(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(inner, _) => {
+            matches!(
+                inner.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            )
+        }
+        _ => false,
+    }
+}
+
+fn write_lock_retry_exhausted(
+    root: &Path,
+    operation: &str,
+    error: crate::DynError,
+) -> crate::DynError {
+    other(format!(
+        "sqlite write lock persisted while {operation} {} for up to {} seconds: {error}",
+        root.display(),
+        WRITE_TX_MAX_WAIT.as_secs(),
+    ))
 }
 
 pub(crate) fn create_schema(conn: &Connection) -> ZgResult<()> {
@@ -192,6 +288,7 @@ pub(crate) fn validate_schema(conn: &Connection) -> ZgResult<()> {
 pub(crate) fn seed_defaults(conn: &Connection) -> ZgResult<()> {
     let settings = [
         ("schema_version", SCHEMA_VERSION.to_string()),
+        ("index_level", DEFAULT_INDEX_LEVEL.to_string()),
         ("chunk_mode", DEFAULT_CHUNK_MODE.to_string()),
         ("chunk_marker", DEFAULT_CHUNK_MARKER.to_string()),
         ("scope_policy", DEFAULT_SCOPE_POLICY.to_string()),
@@ -215,6 +312,25 @@ pub(crate) fn load_setting(conn: &Connection, key: &str) -> ZgResult<Option<Stri
             row.get::<_, String>(0)
         })
         .optional()?)
+}
+
+pub(crate) fn load_index_level(conn: &Connection) -> ZgResult<IndexLevel> {
+    let value = load_setting(conn, "index_level")?;
+    match value {
+        Some(value) => value
+            .parse::<IndexLevel>()
+            .map_err(|error| other(format!("invalid index level setting `{value}`: {error}"))),
+        None => Ok(DEFAULT_INDEX_LEVEL),
+    }
+}
+
+pub(crate) fn set_index_level(conn: &Connection, index_level: IndexLevel) -> ZgResult<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('index_level', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [index_level.as_str()],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn load_state(conn: &Connection) -> ZgResult<Option<StateRow>> {
@@ -266,6 +382,7 @@ pub(crate) fn mark_dirty(root: &Path, reason: &str) -> ZgResult<()> {
         schema_version: SCHEMA_VERSION,
         index_root: root.display().to_string(),
         indexed: paths::is_indexed_root(root),
+        index_level: DEFAULT_INDEX_LEVEL.as_str(),
         chunk_mode: DEFAULT_CHUNK_MODE,
         chunk_marker: DEFAULT_CHUNK_MARKER,
         scope_policy: DEFAULT_SCOPE_POLICY,
@@ -277,6 +394,8 @@ pub(crate) fn mark_dirty(root: &Path, reason: &str) -> ZgResult<()> {
         chunk_count: 0,
         fts_ready: false,
         vector_ready: false,
+        last_index_run_status: None,
+        last_index_run_duration_ms: None,
     };
     fs::write(
         paths::state_path(root),
@@ -295,6 +414,7 @@ pub(crate) fn write_state_mirror(root: &Path, status: &IndexStatus) -> ZgResult<
             .display()
             .to_string(),
         indexed: status.indexed,
+        index_level: status.index_level.as_str(),
         chunk_mode: DEFAULT_CHUNK_MODE,
         chunk_marker: DEFAULT_CHUNK_MARKER,
         scope_policy: DEFAULT_SCOPE_POLICY,
@@ -306,6 +426,8 @@ pub(crate) fn write_state_mirror(root: &Path, status: &IndexStatus) -> ZgResult<
         chunk_count: status.chunk_count,
         fts_ready: status.fts_ready,
         vector_ready: status.vector_ready,
+        last_index_run_status: status.last_index_run_status.clone(),
+        last_index_run_duration_ms: status.last_index_run_duration_ms,
     };
     fs::write(
         paths::state_path(root),
@@ -319,6 +441,7 @@ pub(crate) fn upsert_document(
     rel_path: &str,
     document: &IndexedDocument,
     prepared_vectors: Option<&HashMap<SharedChunkKey, Vec<f32>>>,
+    vectors_enabled: bool,
 ) -> ZgResult<()> {
     let old_counts = load_shared_ref_counts_for_rel_path(conn, rel_path)?;
     delete_file_rows_by_rel_path(conn, rel_path)?;
@@ -341,7 +464,8 @@ pub(crate) fn upsert_document(
     )?;
 
     let file_id = conn.last_insert_rowid();
-    let shared_chunk_ids = resolve_shared_chunk_ids(conn, &document.chunks, prepared_vectors)?;
+    let shared_chunk_ids =
+        resolve_shared_chunk_ids(conn, &document.chunks, prepared_vectors, vectors_enabled)?;
     let mut new_counts = HashMap::<i64, i64>::new();
 
     for (chunk, shared_chunk_id) in document.chunks.iter().zip(shared_chunk_ids.into_iter()) {
@@ -385,11 +509,17 @@ pub(crate) fn upsert_document(
     Ok(())
 }
 
-type SharedChunkKey = (String, String);
+pub(crate) type SharedChunkKey = (String, String);
 
-pub(crate) fn prepare_shared_chunk_vectors(
+pub(crate) fn prepare_missing_shared_chunk_vectors(
+    conn: &Connection,
     documents: &[&IndexedDocument],
+    vectors_enabled: bool,
 ) -> ZgResult<HashMap<SharedChunkKey, Vec<f32>>> {
+    if !vectors_enabled || documents.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     let mut unique_keys = Vec::new();
     let mut seen = HashSet::<SharedChunkKey>::new();
     for document in documents {
@@ -408,16 +538,37 @@ pub(crate) fn prepare_shared_chunk_vectors(
         return Ok(HashMap::new());
     }
 
-    let texts = unique_keys
+    let mut select_stmt = conn.prepare(
+        "SELECT 1
+         FROM shared_chunks
+         WHERE normalized_text_hash = ?1
+           AND normalized_text = ?2",
+    )?;
+    let mut missing_keys = Vec::new();
+    for key in unique_keys {
+        let exists = select_stmt
+            .query_row(params![&key.0, &key.1], |row| row.get::<_, i64>(0))
+            .optional()?
+            .is_some();
+        if !exists {
+            missing_keys.push(key);
+        }
+    }
+
+    if missing_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let texts = missing_keys
         .iter()
         .map(|(_, text)| text.clone())
         .collect::<Vec<_>>();
     let vectors = embed_passages(&texts)?;
-    if vectors.len() != unique_keys.len() {
+    if vectors.len() != missing_keys.len() {
         return Err(other("fastembed returned unexpected embedding count"));
     }
 
-    Ok(unique_keys.into_iter().zip(vectors).collect())
+    Ok(missing_keys.into_iter().zip(vectors).collect())
 }
 
 pub(crate) fn delete_by_rel_path(conn: &Connection, rel_path: &str) -> ZgResult<()> {
@@ -465,6 +616,7 @@ fn resolve_shared_chunk_ids(
     conn: &Connection,
     chunks: &[super::types::IndexedChunk],
     prepared_vectors: Option<&HashMap<SharedChunkKey, Vec<f32>>>,
+    vectors_enabled: bool,
 ) -> ZgResult<Vec<i64>> {
     let mut keys = Vec::with_capacity(chunks.len());
     let mut unique_keys = Vec::new();
@@ -501,29 +653,27 @@ fn resolve_shared_chunk_ids(
 
     if !missing.is_empty() {
         let mut embedded_missing = HashMap::<SharedChunkKey, Vec<f32>>::new();
-        let fallback_missing = missing
-            .iter()
-            .filter(|key| prepared_vectors.is_none_or(|vectors| !vectors.contains_key(*key)))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !fallback_missing.is_empty() {
-            let normalized = fallback_missing
+        if vectors_enabled {
+            let fallback_missing = missing
                 .iter()
-                .map(|(_, text)| text.clone())
+                .filter(|key| prepared_vectors.is_none_or(|vectors| !vectors.contains_key(*key)))
+                .cloned()
                 .collect::<Vec<_>>();
-            let vectors = embed_passages(&normalized)?;
-            if vectors.len() != fallback_missing.len() {
-                return Err(other("fastembed returned unexpected embedding count"));
+            if !fallback_missing.is_empty() {
+                let normalized = fallback_missing
+                    .iter()
+                    .map(|(_, text)| text.clone())
+                    .collect::<Vec<_>>();
+                let vectors = embed_passages(&normalized)?;
+                if vectors.len() != fallback_missing.len() {
+                    return Err(other("fastembed returned unexpected embedding count"));
+                }
+                embedded_missing.extend(fallback_missing.into_iter().zip(vectors));
             }
-            embedded_missing.extend(fallback_missing.into_iter().zip(vectors));
         }
 
         let now = now_unix_ms() as i64;
         for (hash, text) in missing {
-            let vector = prepared_vectors
-                .and_then(|vectors| vectors.get(&(hash.clone(), text.clone())))
-                .or_else(|| embedded_missing.get(&(hash.clone(), text.clone())))
-                .ok_or_else(|| other("failed to resolve prepared embedding for shared chunk"))?;
             conn.execute(
                 "INSERT OR IGNORE INTO shared_chunks (
                     normalized_text_hash,
@@ -537,7 +687,13 @@ fn resolve_shared_chunk_ids(
             let inserted = conn.changes() > 0;
             let shared_chunk_id =
                 select_stmt.query_row(params![&hash, &text], |row| row.get::<_, i64>(0))?;
-            if inserted {
+            if inserted && vectors_enabled {
+                let vector = prepared_vectors
+                    .and_then(|vectors| vectors.get(&(hash.clone(), text.clone())))
+                    .or_else(|| embedded_missing.get(&(hash.clone(), text.clone())))
+                    .ok_or_else(|| {
+                        other("failed to resolve prepared embedding for shared chunk")
+                    })?;
                 let encoded = super::hybrid::encode_vector(vector);
                 conn.execute(
                     "INSERT INTO vec_chunks (shared_chunk_id, dims, vector) VALUES (?1, ?2, ?3)",
@@ -702,6 +858,7 @@ pub(crate) fn load_file_rows_for_scope(
 pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
     let conn = open_existing_db(root)?;
     validate_schema(&conn)?;
+    let index_level = load_index_level(&conn)?;
 
     let file_count =
         conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))? as u64;
@@ -722,17 +879,36 @@ pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
         && conn.query_row("SELECT COUNT(*) FROM vec_index", [], |row| {
             row.get::<_, i64>(0)
         })? as u64
-            == shared_chunk_count;
+            == shared_chunk_count
+        && index_level.vectors_enabled();
     let state = load_state(&conn)?.unwrap_or(StateRow {
         dirty: false,
         dirty_reason: None,
         last_sync_unix_ms: None,
     });
+    let last_index_run = conn
+        .query_row(
+            "SELECT status, started_at_unix_ms, finished_at_unix_ms
+             FROM index_runs
+             ORDER BY id DESC
+             LIMIT 1",
+            [],
+            |row| {
+                let started = row.get::<_, i64>(1)? as u64;
+                let finished = row.get::<_, i64>(2)? as u64;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    finished.saturating_sub(started),
+                ))
+            },
+        )
+        .optional()?;
 
     Ok(IndexStatus {
         requested_path: root.to_path_buf(),
         index_root: Some(root.to_path_buf()),
         indexed: true,
+        index_level,
         chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
         chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
         scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
@@ -744,6 +920,8 @@ pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
         chunk_count,
         fts_ready,
         vector_ready,
+        last_index_run_status: last_index_run.as_ref().map(|(status, _)| status.clone()),
+        last_index_run_duration_ms: last_index_run.map(|(_, duration)| duration),
     })
 }
 
@@ -755,6 +933,7 @@ pub(crate) fn load_state_mirror_status(
         requested_path: requested_path.to_path_buf(),
         index_root,
         indexed: false,
+        index_level: DEFAULT_INDEX_LEVEL,
         chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
         chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
         scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
@@ -766,6 +945,8 @@ pub(crate) fn load_state_mirror_status(
         chunk_count: 0,
         fts_ready: false,
         vector_ready: false,
+        last_index_run_status: None,
+        last_index_run_duration_ms: None,
     }
 }
 
