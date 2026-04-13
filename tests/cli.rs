@@ -4,6 +4,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
+use zg::dev;
 
 fn temp_dir(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -177,6 +178,78 @@ fn indexed_search_prints_stable_result_line_shape() {
     assert!(lines[0].contains("  lexical="));
     assert!(lines[0].contains("  vector="));
     assert!(lines[0].ends_with("sqlite vector adapter"));
+}
+
+#[test]
+fn dev_probe_chunks_emits_json_report() {
+    let root = temp_dir("dev-probe-chunks");
+    let file = root.join("note.md");
+    fs::write(&file, "- alpha\nbeta :: gamma\n").unwrap();
+
+    let output = zg()
+        .args(["dev", "probe", "chunks"])
+        .arg(&file)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"chunk_count\": 1"));
+    assert!(stdout.contains("alpha\\nbeta\\ngamma"));
+}
+
+#[test]
+fn dev_eval_search_quality_accepts_matching_fixture_and_golden() {
+    let root = temp_dir("dev-eval-quality");
+    fs::write(root.join("alpha.md"), "sqlite vector adapter").unwrap();
+
+    let fixture = root.join("fixture.json");
+    let golden = root.join("golden.json");
+    fs::write(
+        &fixture,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "suite_id": "mini",
+            "sample_vault_manifest": "sample.json",
+            "default_limit": 2,
+            "cases": [
+                {
+                    "id": "sqlite-adapter",
+                    "query": "sqlite adapter",
+                    "expectations": {
+                        "must_include": [
+                            {
+                                "path": "alpha.md",
+                                "within_top": 1,
+                                "snippet_contains": "sqlite vector adapter"
+                            }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    dev::write_search_quality_golden(&fixture, &golden, &root).unwrap();
+
+    let output = zg()
+        .args(["dev", "eval", "search-quality"])
+        .arg("--fixture")
+        .arg(&fixture)
+        .arg("--golden")
+        .arg(&golden)
+        .arg("--vault")
+        .arg(&root)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"passed_cases\": 1"));
+    assert!(stdout.contains("\"expectation_failures\": 0"));
+    assert!(stdout.contains("\"golden_failures\": 0"));
 }
 
 #[test]

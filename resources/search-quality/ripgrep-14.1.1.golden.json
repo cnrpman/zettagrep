@@ -13,35 +13,35 @@
           "rel_path": "crates/cli/src/escape.rs",
           "line_start": 33,
           "line_end": 35,
-          "snippet": "function escape_os in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/cli/src/escape.rs"
+          "snippet": "function escape_os in <VAULT_ROOT>/crates/cli/src/escape.rs"
         },
         {
           "rank": 2,
           "rel_path": "crates/core/flags/defs.rs",
           "line_start": 968,
           "line_end": 968,
-          "snippet": "struct Context in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/flags/defs.rs"
+          "snippet": "struct Context in <VAULT_ROOT>/crates/core/flags/defs.rs"
         },
         {
           "rank": 3,
           "rel_path": "crates/cli/src/pattern.rs",
           "line_start": 51,
           "line_end": 59,
-          "snippet": "function pattern_from_os in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/cli/src/pattern.rs"
+          "snippet": "function pattern_from_os in <VAULT_ROOT>/crates/cli/src/pattern.rs"
         },
         {
           "rank": 4,
           "rel_path": "crates/printer/src/stats.rs",
           "line_start": 67,
           "line_end": 69,
-          "snippet": "function matches in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/printer/src/stats.rs"
+          "snippet": "function matches in <VAULT_ROOT>/crates/printer/src/stats.rs"
         },
         {
           "rank": 5,
           "rel_path": "crates/cli/src/escape.rs",
           "line_start": 77,
           "line_end": 79,
-          "snippet": "function unescape_os in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/cli/src/escape.rs"
+          "snippet": "function unescape_os in <VAULT_ROOT>/crates/cli/src/escape.rs"
         }
       ]
     },
@@ -63,7 +63,7 @@
           "rel_path": "crates/ignore/src/lib.rs",
           "line_start": 59,
           "line_end": 59,
-          "snippet": "module overrides in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/ignore/src/lib.rs"
+          "snippet": "module overrides in <VAULT_ROOT>/crates/ignore/src/lib.rs"
         },
         {
           "rank": 3,
@@ -81,31 +81,31 @@
         },
         {
           "rank": 5,
-          "rel_path": "crates/ignore/README.md",
-          "line_start": 59,
-          "line_end": 59,
-          "snippet": "See the documentation for `WalkBuilder` for many other options."
+          "rel_path": "crates/ignore/src/walk.rs",
+          "line_start": 628,
+          "line_end": 631,
+          "snippet": "function follow_links in <VAULT_ROOT>/crates/ignore/src/walk.rs"
         },
         {
           "rank": 6,
           "rel_path": "crates/core/flags/defs.rs",
           "line_start": 4031,
           "line_end": 4031,
-          "snippet": "struct Multiline in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/flags/defs.rs"
+          "snippet": "struct Multiline in <VAULT_ROOT>/crates/core/flags/defs.rs"
         },
         {
           "rank": 7,
           "rel_path": "crates/ignore/src/walk.rs",
-          "line_start": 628,
-          "line_end": 631,
-          "snippet": "function follow_links in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/ignore/src/walk.rs"
+          "line_start": 733,
+          "line_end": 736,
+          "snippet": "function hidden in <VAULT_ROOT>/crates/ignore/src/walk.rs"
         },
         {
           "rank": 8,
           "rel_path": "tests/tests.rs",
           "line_start": 20,
           "line_end": 20,
-          "snippet": "module multiline in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/tests/tests.rs"
+          "snippet": "module multiline in <VAULT_ROOT>/tests/tests.rs"
         }
       ]
     },
@@ -120,21 +120,21 @@
           "rel_path": "crates/core/flags/hiargs.rs",
           "line_start": 355,
           "line_end": 359,
-          "snippet": "function haystack_builder in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/flags/hiargs.rs"
+          "snippet": "function haystack_builder in <VAULT_ROOT>/crates/core/flags/hiargs.rs"
         },
         {
           "rank": 2,
           "rel_path": "crates/core/flags/defs.rs",
           "line_start": 6839,
           "line_end": 6839,
-          "snippet": "struct TypeAdd in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/flags/defs.rs"
+          "snippet": "struct TypeAdd in <VAULT_ROOT>/crates/core/flags/defs.rs"
         },
         {
           "rank": 3,
           "rel_path": "crates/core/haystack.rs",
           "line_start": 22,
           "line_end": 24,
-          "snippet": "function new in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/haystack.rs"
+          "snippet": "function new in <VAULT_ROOT>/crates/core/haystack.rs"
         },
         {
           "rank": 4,
@@ -148,7 +148,7 @@
           "rel_path": "crates/core/haystack.rs",
           "line_start": 16,
           "line_end": 18,
-          "snippet": "struct HaystackBuilder in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/haystack.rs"
+          "snippet": "struct HaystackBuilder in <VAULT_ROOT>/crates/core/haystack.rs"
         },
         {
           "rank": 6,
@@ -162,7 +162,7 @@
           "rel_path": "crates/core/haystack.rs",
           "line_start": 85,
           "line_end": 91,
-          "snippet": "function strip_dot_prefix in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/haystack.rs"
+          "snippet": "function strip_dot_prefix in <VAULT_ROOT>/crates/core/haystack.rs"
         },
         {
           "rank": 8,
@@ -184,21 +184,21 @@
           "rel_path": "crates/printer/src/json.rs",
           "line_start": 50,
           "line_end": 52,
-          "snippet": "struct JSONBuilder in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/printer/src/json.rs"
+          "snippet": "struct JSONBuilder in <VAULT_ROOT>/crates/printer/src/json.rs"
         },
         {
           "rank": 2,
           "rel_path": "crates/ignore/src/lib.rs",
           "line_start": 59,
           "line_end": 59,
-          "snippet": "module overrides in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/ignore/src/lib.rs"
+          "snippet": "module overrides in <VAULT_ROOT>/crates/ignore/src/lib.rs"
         },
         {
           "rank": 3,
           "rel_path": "crates/printer/src/json.rs",
           "line_start": 56,
           "line_end": 58,
-          "snippet": "function new in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/printer/src/json.rs"
+          "snippet": "function new in <VAULT_ROOT>/crates/printer/src/json.rs"
         },
         {
           "rank": 4,
@@ -212,7 +212,7 @@
           "rel_path": "crates/printer/src/json.rs",
           "line_start": 75,
           "line_end": 78,
-          "snippet": "function pretty in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/printer/src/json.rs"
+          "snippet": "function pretty in <VAULT_ROOT>/crates/printer/src/json.rs"
         }
       ]
     },
@@ -227,35 +227,35 @@
           "rel_path": "crates/regex/src/matcher.rs",
           "line_start": 24,
           "line_end": 26,
-          "snippet": "struct RegexMatcherBuilder in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/regex/src/matcher.rs"
+          "snippet": "struct RegexMatcherBuilder in <VAULT_ROOT>/crates/regex/src/matcher.rs"
         },
         {
           "rank": 2,
           "rel_path": "crates/matcher/src/lib.rs",
           "line_start": 291,
           "line_end": 291,
-          "snippet": "struct BitSet in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/matcher/src/lib.rs"
+          "snippet": "struct BitSet in <VAULT_ROOT>/crates/matcher/src/lib.rs"
         },
         {
           "rank": 3,
           "rel_path": "crates/regex/src/matcher.rs",
           "line_start": 29,
           "line_end": 31,
-          "snippet": "function default in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/regex/src/matcher.rs"
+          "snippet": "function default in <VAULT_ROOT>/crates/regex/src/matcher.rs"
         },
         {
           "rank": 4,
           "rel_path": "crates/core/flags/defs.rs",
           "line_start": 3843,
           "line_end": 3843,
-          "snippet": "struct MaxDepth in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/flags/defs.rs"
+          "snippet": "struct MaxDepth in <VAULT_ROOT>/crates/core/flags/defs.rs"
         },
         {
           "rank": 5,
           "rel_path": "crates/regex/src/matcher.rs",
           "line_start": 36,
           "line_end": 38,
-          "snippet": "function new in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/regex/src/matcher.rs"
+          "snippet": "function new in <VAULT_ROOT>/crates/regex/src/matcher.rs"
         },
         {
           "rank": 6,
@@ -269,21 +269,21 @@
           "rel_path": "crates/pcre2/src/matcher.rs",
           "line_start": 12,
           "line_end": 18,
-          "snippet": "struct RegexMatcherBuilder in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/pcre2/src/matcher.rs"
+          "snippet": "struct RegexMatcherBuilder in <VAULT_ROOT>/crates/pcre2/src/matcher.rs"
         },
         {
           "rank": 8,
           "rel_path": "crates/matcher/src/interpolate.rs",
           "line_start": 80,
           "line_end": 82,
-          "snippet": "function from in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/matcher/src/interpolate.rs"
+          "snippet": "function from in <VAULT_ROOT>/crates/matcher/src/interpolate.rs"
         },
         {
           "rank": 9,
           "rel_path": "crates/pcre2/src/matcher.rs",
           "line_start": 240,
           "line_end": 242,
-          "snippet": "function disable_utf_check in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/pcre2/src/matcher.rs"
+          "snippet": "function disable_utf_check in <VAULT_ROOT>/crates/pcre2/src/matcher.rs"
         },
         {
           "rank": 10,
@@ -305,35 +305,35 @@
           "rel_path": "crates/searcher/src/line_buffer.rs",
           "line_start": 6,
           "line_end": 6,
-          "snippet": "constant DEFAULT_BUFFER_CAPACITY in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/searcher/src/line_buffer.rs"
+          "snippet": "constant DEFAULT_BUFFER_CAPACITY in <VAULT_ROOT>/crates/searcher/src/line_buffer.rs"
         },
         {
           "rank": 2,
           "rel_path": "crates/regex/src/literal.rs",
           "line_start": 452,
           "line_end": 454,
-          "snippet": "function empty in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/regex/src/literal.rs"
+          "snippet": "function empty in <VAULT_ROOT>/crates/regex/src/literal.rs"
         },
         {
           "rank": 3,
           "rel_path": "crates/searcher/src/searcher/glue.rs",
           "line_start": 633,
           "line_end": 649,
-          "snippet": "function big1 in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/searcher/src/searcher/glue.rs"
+          "snippet": "function big1 in <VAULT_ROOT>/crates/searcher/src/searcher/glue.rs"
         },
         {
           "rank": 4,
           "rel_path": "crates/searcher/src/sink.rs",
           "line_start": 47,
           "line_end": 49,
-          "snippet": "function error_io in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/searcher/src/sink.rs"
+          "snippet": "function error_io in <VAULT_ROOT>/crates/searcher/src/sink.rs"
         },
         {
           "rank": 5,
           "rel_path": "crates/searcher/src/searcher/glue.rs",
           "line_start": 717,
           "line_end": 749,
-          "snippet": "function binary3 in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/searcher/src/searcher/glue.rs"
+          "snippet": "function binary3 in <VAULT_ROOT>/crates/searcher/src/searcher/glue.rs"
         }
       ]
     },
@@ -348,7 +348,7 @@
           "rel_path": "crates/core/flags/hiargs.rs",
           "line_start": 584,
           "line_end": 593,
-          "snippet": "function printer_json in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/core/flags/hiargs.rs"
+          "snippet": "function printer_json in <VAULT_ROOT>/crates/core/flags/hiargs.rs"
         },
         {
           "rank": 2,
@@ -362,7 +362,7 @@
           "rel_path": "crates/printer/src/json.rs",
           "line_start": 887,
           "line_end": 889,
-          "snippet": "function printer_contents in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/printer/src/json.rs"
+          "snippet": "function printer_contents in <VAULT_ROOT>/crates/printer/src/json.rs"
         },
         {
           "rank": 4,
@@ -373,10 +373,10 @@
         },
         {
           "rank": 5,
-          "rel_path": "crates/printer/src/json.rs",
-          "line_start": 460,
-          "line_end": 462,
-          "snippet": "function new in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/printer/src/json.rs"
+          "rel_path": "crates/printer/src/lib.rs",
+          "line_start": 97,
+          "line_end": 97,
+          "snippet": "module json in <VAULT_ROOT>/crates/printer/src/lib.rs"
         },
         {
           "rank": 6,
@@ -387,10 +387,10 @@
         },
         {
           "rank": 7,
-          "rel_path": "crates/printer/src/lib.rs",
-          "line_start": 97,
-          "line_end": 97,
-          "snippet": "module json in /Users/jun/git/zettagrep/resources/search-quality/../sample-vaults/.cache/ripgrep-14.1.1/crates/printer/src/lib.rs"
+          "rel_path": "crates/printer/src/json.rs",
+          "line_start": 460,
+          "line_end": 462,
+          "snippet": "function new in <VAULT_ROOT>/crates/printer/src/json.rs"
         },
         {
           "rank": 8,
