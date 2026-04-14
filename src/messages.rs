@@ -71,6 +71,36 @@ pub fn explicit_index_required_error(
     lines.join("\n")
 }
 
+pub fn init_force_required_error(
+    root: &Path,
+    index_level: IndexLevel,
+    estimated_chunks: usize,
+    recommended_chunk_limit: usize,
+    force_threshold: usize,
+) -> String {
+    let rerun = match index_level {
+        IndexLevel::Fts => format!("zg index init --force \"{}\"", root.display()),
+        IndexLevel::FtsVector => format!(
+            "zg index init --level fts+vector --force \"{}\"",
+            root.display()
+        ),
+    };
+
+    [
+        format!(
+            "zg: `zg index init --level {index_level}` for {} estimates {} chunks",
+            root.display(),
+            estimated_chunks
+        ),
+        format!(
+            "    sanity check: level {index_level} is recommended around {} chunks; > {} chunks (10x) requires `--force`",
+            recommended_chunk_limit, force_threshold
+        ),
+        format!("    rerun `{rerun}` if this larger index is intentional"),
+    ]
+    .join("\n")
+}
+
 pub fn index_level_follow_up(
     root: &Path,
     index_level: IndexLevel,

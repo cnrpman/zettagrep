@@ -214,7 +214,7 @@ pub fn run_sample_vault_benchmark(
                     .unwrap_or_else(|| scratch_vault.clone());
                 let command = run_timed_command(
                     exe_path,
-                    &["search", &case.query, &scope.display().to_string()],
+                    &[&case.query, &scope.display().to_string()],
                     fake_embeddings,
                 )?;
                 query_times.push(command.elapsed_ms);

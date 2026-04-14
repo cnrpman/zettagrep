@@ -9,11 +9,11 @@ use regex_syntax::{
 };
 
 use crate::ZgResult;
-pub use backend::{GrepHit, ScanBackend};
+pub use backend::{GrepHit, ScanBackend, SearchContext};
 use ripgrep_backend::RipgrepScanBackend;
 
-pub fn regex_search(pattern: &str, root: &Path) -> ZgResult<Vec<GrepHit>> {
-    RipgrepScanBackend.regex_search(root, pattern)
+pub fn regex_search(pattern: &str, root: &Path, context: SearchContext) -> ZgResult<Vec<GrepHit>> {
+    RipgrepScanBackend.regex_search(root, pattern, context)
 }
 
 pub fn literal_search(pattern: &str, root: &Path) -> ZgResult<Vec<GrepHit>> {

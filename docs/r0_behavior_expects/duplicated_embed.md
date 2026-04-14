@@ -1,1 +1,0 @@
-2个zg 都在查同一个需要重新embed的脏目录，一个zg拿到了锁，完成了vector embedding后，释放给另一个zg后还会重复做 vector embed 吗？期望行为是 不会重复 embed

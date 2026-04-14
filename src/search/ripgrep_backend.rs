@@ -9,21 +9,26 @@ use serde::Deserialize;
 use crate::paths;
 use crate::{ZgResult, other};
 
-use super::backend::{GrepHit, ScanBackend};
+use super::backend::{GrepHit, ScanBackend, SearchContext};
 
 const RG_BUNDLED_RELATIVE_PATHS: &[&str] = &["rg", "../libexec/rg"];
 
 pub struct RipgrepScanBackend;
 
 impl ScanBackend for RipgrepScanBackend {
-    fn regex_search(&self, root: &Path, pattern: &str) -> ZgResult<Vec<GrepHit>> {
+    fn regex_search(
+        &self,
+        root: &Path,
+        pattern: &str,
+        context: SearchContext,
+    ) -> ZgResult<Vec<GrepHit>> {
         let root = paths::resolve_existing_path(root)?;
         if has_zg_component(&root) {
             return Ok(Vec::new());
         }
 
         let rg = resolve_rg_binary()?;
-        let mut hits = run_rg(&rg, pattern, &root, false)?;
+        let mut hits = run_rg(&rg, pattern, &root, false, context)?;
         hits.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -40,7 +45,7 @@ impl ScanBackend for RipgrepScanBackend {
         }
 
         let rg = resolve_rg_binary()?;
-        let mut hits = run_rg(&rg, pattern, &root, true)?;
+        let mut hits = run_rg(&rg, pattern, &root, true, SearchContext::default())?;
         hits.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -103,7 +108,13 @@ fn has_zg_component(path: &Path) -> bool {
         .any(|component| matches!(component, Component::Normal(name) if name == ".zg"))
 }
 
-fn run_rg(rg: &OsStr, pattern: &str, root: &Path, fixed_strings: bool) -> ZgResult<Vec<GrepHit>> {
+fn run_rg(
+    rg: &OsStr,
+    pattern: &str,
+    root: &Path,
+    fixed_strings: bool,
+    context: SearchContext,
+) -> ZgResult<Vec<GrepHit>> {
     let mut command = Command::new(rg);
     command
         .arg("--json")
@@ -112,6 +123,16 @@ fn run_rg(rg: &OsStr, pattern: &str, root: &Path, fixed_strings: bool) -> ZgResu
         .arg("never")
         .arg("--glob")
         .arg("!.zg/**");
+    if context.before > 0 {
+        command
+            .arg("--before-context")
+            .arg(context.before.to_string());
+    }
+    if context.after > 0 {
+        command
+            .arg("--after-context")
+            .arg(context.after.to_string());
+    }
     if fixed_strings {
         command.arg("--fixed-strings").arg("--ignore-case");
     }
@@ -143,7 +164,7 @@ fn parse_rg_json_stream(stdout: &[u8]) -> ZgResult<Vec<GrepHit>> {
         }
 
         let message: RgMessage = serde_json::from_slice(line)?;
-        if message.kind != "match" {
+        if !matches!(message.kind.as_str(), "match" | "context") {
             continue;
         }
 
@@ -223,7 +244,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{RipgrepScanBackend, parse_rg_json_stream, resolve_rg_binary_with};
+    use super::{RipgrepScanBackend, SearchContext, parse_rg_json_stream, resolve_rg_binary_with};
     use crate::search::backend::ScanBackend;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -258,7 +279,9 @@ mod tests {
         fs::write(child.join("ignored.md"), "needle ignored").unwrap();
         fs::write(child.join("keep.md"), "needle visible").unwrap();
 
-        let hits = RipgrepScanBackend.regex_search(&child, "needle").unwrap();
+        let hits = RipgrepScanBackend
+            .regex_search(&child, "needle", SearchContext::default())
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("keep.md"));
     }
@@ -271,7 +294,9 @@ mod tests {
         let file = hidden.join("state.txt");
         fs::write(&file, "needle").unwrap();
 
-        let hits = RipgrepScanBackend.regex_search(&file, "needle").unwrap();
+        let hits = RipgrepScanBackend
+            .regex_search(&file, "needle", SearchContext::default())
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -281,7 +306,9 @@ mod tests {
         fs::write(root.join("b.md"), "needle second\nneedle third").unwrap();
         fs::write(root.join("a.md"), "needle first").unwrap();
 
-        let hits = RipgrepScanBackend.regex_search(&root, "needle").unwrap();
+        let hits = RipgrepScanBackend
+            .regex_search(&root, "needle", SearchContext::default())
+            .unwrap();
         let rendered = hits
             .iter()
             .map(|hit| {
@@ -310,7 +337,9 @@ mod tests {
         let file = root.join("note.md");
         fs::write(&file, "alpha\nneedle one\nbeta\nneedle two").unwrap();
 
-        let hits = RipgrepScanBackend.regex_search(&file, "needle").unwrap();
+        let hits = RipgrepScanBackend
+            .regex_search(&file, "needle", SearchContext::default())
+            .unwrap();
         let lines = hits
             .iter()
             .map(|hit| (hit.line_number, hit.line.as_str()))
@@ -364,5 +393,19 @@ mod tests {
         assert_eq!(hits[0].path, PathBuf::from("/tmp/a.txt"));
         assert_eq!(hits[0].line_number, 2);
         assert_eq!(hits[0].line, "needle:x");
+    }
+
+    #[test]
+    fn parse_rg_json_stream_extracts_context_events() {
+        let input = br#"{"type":"context","data":{"path":{"text":"/tmp/a.txt"},"lines":{"text":"before line\n"},"line_number":1,"absolute_offset":0,"submatches":[]}}
+{"type":"match","data":{"path":{"text":"/tmp/a.txt"},"lines":{"text":"needle:x\n"},"line_number":2,"absolute_offset":11,"submatches":[]}}
+"#;
+
+        let hits = parse_rg_json_stream(input).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].line_number, 1);
+        assert_eq!(hits[0].line, "before line");
+        assert_eq!(hits[1].line_number, 2);
+        assert_eq!(hits[1].line, "needle:x");
     }
 }

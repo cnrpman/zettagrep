@@ -23,8 +23,8 @@ Date: 2026-04-12
 | `ignore` | `0.4.25` | `src/walk.rs`、`src/index/files.rs`、`src/index/util.rs`，负责 indexed traversal 的 ripgrep-style visibility rules | 同属 `ripgrep` 生态；docs.rs 当前为 `0.4.25`；上游 `ripgrep` 约 `62.3k` stars | 兼容性非常高。你们明确要求 indexed traversal 复用 ripgrep-style visibility rules，这正是 `ignore` 的强项 | 强烈保留 |
 | `regex-syntax` | `0.8.10` | `src/search/mod.rs`，负责 regex-like query 的语法分析与判定辅助 | `rust-lang/regex` GitHub 约 `3.8k` stars；`regex-syntax` 是同生态核心组件 | 兼容性高。当前只拿它做“是否像 regex”的更稳健判定，没有把整个搜索栈绑到新的正则 runtime 上 | 保留 |
 | `rusqlite` | `0.32.1` | `src/index/db.rs`、`src/index/sync.rs`、`src/index/hybrid.rs`，负责所有 SQLite 访问 | docs.rs 显示 `rusqlite` 最新线在 2026-03 仍有发布，仓库链接约 `4.1k` stars | 兼容性非常高。repo 的索引模型就是 SQLite-first，且 `bundled` feature 很适合这种自己控制 DB 文件的 CLI | 强烈保留。只是当前锁在较老 minor 线，后续可计划升级 |
-| `serde` | `1.0.228` | `src/index/types.rs` 里 `StateMirror` 序列化 | docs.rs 链接到 `serde-rs/serde` 约 `10.5k` stars；版本发布频率很高 | 兼容性非常高，且使用面很小很稳 | 强烈保留 |
-| `serde_json` | `1.0.149` | `src/index/db.rs`，负责写 `.zg/state.json` | docs.rs 链接到 `serde-rs/json` 约 `5.5k` stars；`1.0.149` 也是近几个月发布 | 兼容性非常高，当前只做轻量 JSON mirror，没有滥用 | 强烈保留 |
+| `serde` | `1.0.228` | `src/index/types.rs` 里 `StateSnapshot` 序列化 | docs.rs 链接到 `serde-rs/serde` 约 `10.5k` stars；版本发布频率很高 | 兼容性非常高，且使用面很小很稳 | 强烈保留 |
+| `serde_json` | `1.0.149` | `src/index/db.rs`，负责写 `.zg/state.json` | docs.rs 链接到 `serde-rs/json` 约 `5.5k` stars；`1.0.149` 也是近几个月发布 | 兼容性非常高，当前只做轻量 JSON snapshot，没有滥用 | 强烈保留 |
 | `sqlite-vec` | `0.1.9` | `src/index/db.rs`，负责注册 `sqlite3_vec_init`；`src/index/hybrid.rs` 围绕 `vec0` 查询设计语义检索 | `asg017/sqlite-vec` GitHub 约 `6.8k` stars；docs.rs 显示 2026-03 仍在活跃发版；README 明确声明它仍处于较早阶段 | 兼容性高。你们已经把 schema、SQL 路径、scope filter 都围绕 `vec0` 设计，替换成本很高 | 保留，但必须把它视为“核心但有升级风险”的依赖 |
 | `thiserror` | `2.0.18` | `src/lib.rs`，用于轻量自定义错误类型 | `thiserror` 是 Rust 里最常见的 error derive 之一 | 兼容性高。当前只拿它给 repo 自定义 message error 做 derive，侵入性很低 | 保留 |
 
@@ -47,7 +47,7 @@ Date: 2026-04-12
 - 后续又完成了 1 个高价值替换:
   - 手写 FNV-like hash -> `blake3`
 - 再后续又完成了 1 个高价值替换:
-  - 库内 grep facade -> runtime `rg` subprocess backend
+  - 搜索栈的 grep facade -> runtime `rg` subprocess backend
 
 ## Compatibility Notes
 
@@ -70,7 +70,7 @@ Date: 2026-04-12
 - `src/main.rs`
   - 用 `clap` 替掉了手写 `env::args()` 分发
   - 保留了默认入口 `zg <query> [path]`
-  - 保留了 `grep` / `search` / `index *` 子命令
+  - 保留了 `grep` / `index *` 子命令
 - `src/lib.rs`
   - 错误边界收口到 `anyhow::Result`
   - 保留了轻量 message error，但改成 `thiserror` derive
@@ -81,6 +81,7 @@ Date: 2026-04-12
   - 不再自己维护 ripgrep 搜索逻辑，改为调用 runtime `rg`
   - 运行时按 `ZG_RG_BIN` -> bundled `rg` -> `PATH` 顺序解析
   - 不再自己枚举文件；regex traversal 交给 `rg` 本身递归
+  - indexed search 的 fixed-string literal recall 也复用这个 runtime `rg` backend，所以 `rg` 是当前整个 search surface 的 runtime dependency
 - `src/index/util.rs`
   - 用 `blake3` 替掉了手写 FNV-like hash
   - 配合 schema version bump，避免旧索引和新 hash 语义混用
@@ -124,7 +125,7 @@ Date: 2026-04-12
 对 `zg` 这个仓库，我的判断是:
 
 - 现在已经不是一个只有一个位置参数的小命令了
-- 已经有默认入口、显式 `grep` / `search` / `index *` 子命令
+- 已经有默认入口、显式 `grep` / `index *` 子命令
 - 后面大概率还会长出更多状态显示、索引策略、模型路径、调试类参数
 
 当前结论不再是建议，而是已验证实现:

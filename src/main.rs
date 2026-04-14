@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use zg::dev;
 use zg::index::{self, IndexLevel, IndexStatus};
@@ -34,6 +34,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
+    #[command(flatten)]
+    context: ContextArgs,
+
     #[arg(
         value_name = "QUERY",
         required = true,
@@ -54,6 +57,8 @@ struct Cli {
 enum Commands {
     #[command(about = "Run regex search immediately with ripgrep semantics")]
     Grep {
+        #[command(flatten)]
+        context: ContextArgs,
         #[arg(
             value_name = "PATTERN",
             allow_hyphen_values = true,
@@ -64,21 +69,6 @@ enum Commands {
             value_name = "PATH",
             allow_hyphen_values = true,
             help = "File or directory to search; defaults to the current directory"
-        )]
-        path: Option<PathBuf>,
-    },
-    #[command(about = "Run indexed plain-text search inside the nearest ancestor `.zg/` root")]
-    Search {
-        #[arg(
-            value_name = "QUERY",
-            allow_hyphen_values = true,
-            help = "Plain-text query to resolve against the local `.zg/` index"
-        )]
-        query: String,
-        #[arg(
-            value_name = "PATH",
-            allow_hyphen_values = true,
-            help = "File or directory scope to search; defaults to the current directory"
         )]
         path: Option<PathBuf>,
     },
@@ -94,6 +84,25 @@ enum Commands {
     },
 }
 
+#[derive(Args, Clone, Debug, Default, PartialEq)]
+struct ContextArgs {
+    #[arg(short = 'A', long = "after-context", value_name = "NUM")]
+    after_context: Option<usize>,
+    #[arg(short = 'B', long = "before-context", value_name = "NUM")]
+    before_context: Option<usize>,
+    #[arg(short = 'C', long = "context", value_name = "NUM")]
+    context: Option<usize>,
+}
+
+impl ContextArgs {
+    fn resolve(&self) -> search::SearchContext {
+        search::SearchContext {
+            before: self.before_context.or(self.context).unwrap_or(0),
+            after: self.after_context.or(self.context).unwrap_or(0),
+        }
+    }
+}
+
 #[derive(Debug, Subcommand, PartialEq)]
 enum IndexCommands {
     #[command(about = "Create a local `.zg/` index for a directory")]
@@ -105,6 +114,11 @@ enum IndexCommands {
             help = "Index level to build: `fts` for lexical only, `fts+vector` for hybrid recall"
         )]
         level: CliIndexLevel,
+        #[arg(
+            long,
+            help = "Skip the large-index sanity check when estimated chunks are more than 10x above the recommended range for this level"
+        )]
+        force: bool,
         #[arg(
             value_name = "PATH",
             allow_hyphen_values = true,
@@ -308,15 +322,20 @@ where
 
 fn run_cli(cli: Cli) -> ZgResult<()> {
     match cli.command {
-        Some(Commands::Grep { pattern, path }) => run_grep(&pattern, path.as_deref()),
-        Some(Commands::Search { query, path }) => run_search(&query, path.as_deref()),
+        Some(Commands::Grep {
+            context,
+            pattern,
+            path,
+        }) => run_grep(&pattern, path.as_deref(), context.resolve()),
         Some(Commands::Index { command }) => run_index_command(command),
         Some(Commands::Dev { command }) => run_dev_command(command),
         None => {
             let query = cli.query.ok_or_else(|| other("missing query"))?;
             match resolve_search_mode(&query) {
-                SearchMode::Regex => run_grep(&query, cli.path.as_deref()),
-                SearchMode::Indexed => run_search(&query, cli.path.as_deref()),
+                SearchMode::Regex => run_grep(&query, cli.path.as_deref(), cli.context.resolve()),
+                SearchMode::Indexed => {
+                    run_search(&query, cli.path.as_deref(), cli.context.resolve())
+                }
             }
         }
     }
@@ -324,9 +343,19 @@ fn run_cli(cli: Cli) -> ZgResult<()> {
 
 fn run_index_command(command: IndexCommands) -> ZgResult<()> {
     match command {
-        IndexCommands::Init { level, path } => {
+        IndexCommands::Init { level, force, path } => {
             let root = resolve_dir_arg(path.as_deref())?;
             let index_level = IndexLevel::from(level);
+            let preflight = index::preflight_init(&root, index_level)?;
+            if preflight.requires_force && !force {
+                return Err(other(messages::init_force_required_error(
+                    &root,
+                    index_level,
+                    preflight.estimated_chunks,
+                    preflight.recommended_chunk_limit,
+                    preflight.force_threshold,
+                )));
+            }
             maybe_print_vector_index_start_notice(&root, index_level, "init");
             let stats = index::init_index_with_level(&root, index_level)?;
             println!(
@@ -386,7 +415,8 @@ fn effective_rebuild_level(
 ) -> Option<IndexLevel> {
     index_level_override.or_else(|| {
         let status = index::load_status(root).ok()?;
-        (status.index_root.as_deref() == Some(root)).then_some(status.index_level)
+        (status.index_root.as_deref() == Some(root) && status.index_level_known())
+            .then_some(status.index_level)
     })
 }
 
@@ -507,9 +537,9 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
     }
 }
 
-fn run_grep(pattern: &str, path: Option<&Path>) -> ZgResult<()> {
+fn run_grep(pattern: &str, path: Option<&Path>, context: search::SearchContext) -> ZgResult<()> {
     let root = resolve_path_arg(path)?;
-    let hits = search::regex_search(pattern, &root)?
+    let hits = search::regex_search(pattern, &root, context)?
         .into_iter()
         .map(|hit| RenderedSearchHit {
             path: hit.path.display().to_string(),
@@ -522,32 +552,28 @@ fn run_grep(pattern: &str, path: Option<&Path>) -> ZgResult<()> {
     Ok(())
 }
 
-fn run_search(query: &str, path: Option<&Path>) -> ZgResult<()> {
+fn run_search(query: &str, path: Option<&Path>, context: search::SearchContext) -> ZgResult<()> {
     let requested = resolve_path_arg(path)?;
-    match resolve_search_mode(query) {
-        SearchMode::Regex => run_grep(query, Some(&requested)),
-        SearchMode::Indexed => {
-            let root = index::require_index_root_for_search(&requested)?;
-            index::reconcile_covering_roots(&requested)?;
-            let hits = index::search_indexed(&root, &requested, query, 20)?;
-            let hits = hits
-                .into_iter()
-                .map(|hit| {
-                    format_search_result(
-                        &hit.rel_path,
-                        hit.line_start,
-                        hit.line_end,
-                        hit.indexed_text_match,
-                        hit.partial_text_match,
-                        hit.vector_score > f64::EPSILON,
-                        &hit.snippet,
-                    )
-                })
-                .collect::<Vec<_>>();
-            print!("{}", render_search_hits(&hits, SearchOutputStyle::detect()));
-            Ok(())
-        }
-    }
+    let root = index::require_index_root_for_search(&requested)?;
+    index::reconcile_covering_roots(&requested)?;
+    let hits = index::search_indexed_with_context(&root, &requested, query, 20, context)?;
+    let hits = hits
+        .into_iter()
+        .map(|hit| {
+            format_search_result(
+                &hit.rel_path,
+                hit.line_start,
+                hit.line_end,
+                hit.indexed_text_match,
+                hit.partial_text_match,
+                hit.vector_score > f64::EPSILON,
+                &hit.snippet,
+                context.has_context(),
+            )
+        })
+        .collect::<Vec<_>>();
+    print!("{}", render_search_hits(&hits, SearchOutputStyle::detect()));
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -592,11 +618,12 @@ fn format_search_result(
     partial_text_match: bool,
     semantic_match: bool,
     snippet: &str,
+    multiline_preview: bool,
 ) -> RenderedSearchHit {
     RenderedSearchHit {
         path: rel_path.to_string(),
         line_label: format_line_label(line_start, line_end),
-        preview: inline_preview(snippet),
+        preview: format_preview(snippet, multiline_preview),
         classification: Some(display_channel(
             indexed_text_match,
             partial_text_match,
@@ -672,6 +699,19 @@ fn inline_preview(snippet: &str) -> String {
     snippet.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn format_preview(snippet: &str, multiline: bool) -> String {
+    if multiline {
+        snippet
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        inline_preview(snippet)
+    }
+}
+
 fn display_channel(
     indexed_text_match: bool,
     partial_text_match: bool,
@@ -745,7 +785,7 @@ fn format_status(status: &IndexStatus) -> String {
             .unwrap_or_else(|| "none".to_string())
     ));
     lines.push(format!("indexed: {}", yes_no(status.indexed)));
-    lines.push(format!("index level: {}", status.index_level));
+    lines.push(format!("index level: {}", display_index_level(status)));
     lines.push(format!("chunking: {}", status.chunk_mode));
     lines.push(format!("marker: {}", status.chunk_marker));
     lines.push(format!("scope policy: {}", status.scope_policy));
@@ -783,6 +823,16 @@ fn format_status(status: &IndexStatus) -> String {
             .unwrap_or_else(|| "never".to_string())
     ));
     lines.join("\n") + "\n"
+}
+
+fn display_index_level(status: &IndexStatus) -> String {
+    if status.index_root.is_none() {
+        "-".to_string()
+    } else if status.index_level_known() {
+        status.index_level.to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 fn format_search_quality_report(report: &dev::SearchQualityReport) -> String {
@@ -989,9 +1039,12 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rusqlite::Connection;
+
     use super::{
-        Cli, Commands, IndexCommands, SearchMode, SearchOutputStyle, format_search_result,
-        format_status, parse_cli_from, render_search_hits, resolve_search_mode,
+        Cli, Commands, ContextArgs, IndexCommands, SearchMode, SearchOutputStyle,
+        format_search_result, format_status, parse_cli_from, render_search_hits,
+        resolve_search_mode,
     };
     use zg::index::{self, IndexLevel};
     use zg::messages;
@@ -1047,6 +1100,25 @@ mod tests {
             cli,
             Cli {
                 command: None,
+                context: ContextArgs::default(),
+                query: Some("sqlite vector".to_string()),
+                path: Some(PathBuf::from("docs")),
+            }
+        );
+    }
+
+    #[test]
+    fn default_entrypoint_parses_shared_context_flags() {
+        let cli = parse_cli_from(["zg", "-C", "2", "sqlite vector", "docs"]).unwrap();
+        assert_eq!(
+            cli,
+            Cli {
+                command: None,
+                context: ContextArgs {
+                    after_context: None,
+                    before_context: None,
+                    context: Some(2),
+                },
                 query: Some("sqlite vector".to_string()),
                 path: Some(PathBuf::from("docs")),
             }
@@ -1072,10 +1144,31 @@ mod tests {
         let status = index::load_status(&root).unwrap();
 
         let rendered = format_status(&status);
-        assert!(rendered.contains("index level: fts"));
+        assert!(rendered.contains("index level: -"));
         assert!(rendered.contains("walk policy: ripgrep-style:"));
         assert!(rendered.contains(".zgignore"));
         assert!(rendered.contains(".zg/ always skipped"));
+    }
+
+    #[test]
+    fn corrupted_status_preserves_last_known_index_level() {
+        let root = temp_dir("status-corrupt");
+        fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+        index::init_index_with_level(&root, IndexLevel::FtsVector).unwrap();
+
+        let conn = Connection::open(root.join(".zg/index.db")).unwrap();
+        conn.execute(
+            "UPDATE settings SET value = '5' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+
+        let status = index::load_status(&root).unwrap();
+        let rendered = format_status(&status);
+        assert!(rendered.contains("indexed: yes"));
+        assert!(rendered.contains("index level: fts+vector"));
+        assert!(rendered.contains("dirty: yes"));
+        assert!(rendered.contains("schema/version mismatch"));
     }
 
     #[test]
@@ -1112,6 +1205,22 @@ mod tests {
     }
 
     #[test]
+    fn oversized_init_message_requires_force_rerun() {
+        let root = temp_dir("oversized-init");
+        let rendered = messages::init_force_required_error(
+            &root,
+            IndexLevel::FtsVector,
+            10_241,
+            1_024,
+            10_240,
+        );
+
+        assert!(rendered.contains("estimates 10241 chunks"));
+        assert!(rendered.contains("> 10240 chunks (10x) requires `--force`"));
+        assert!(rendered.contains("zg index init --level fts+vector --force"));
+    }
+
+    #[test]
     fn status_hint_shows_upgrade_for_small_fts_indexes() {
         let root = temp_dir("status-hint");
         let mut status = index::load_status(&root).unwrap();
@@ -1139,8 +1248,41 @@ mod tests {
             Some(Commands::Index {
                 command: IndexCommands::Init {
                     level: super::CliIndexLevel::FtsVector,
+                    force: false,
                     path: Some(PathBuf::from("docs")),
                 },
+            })
+        );
+    }
+
+    #[test]
+    fn init_subcommand_accepts_force_flag() {
+        let cli = parse_cli_from(["zg", "index", "init", "--force", "docs"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Index {
+                command: IndexCommands::Init {
+                    level: super::CliIndexLevel::Fts,
+                    force: true,
+                    path: Some(PathBuf::from("docs")),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn grep_subcommand_accepts_shared_context_flags() {
+        let cli = parse_cli_from(["zg", "grep", "-A", "1", "-B", "2", "needle", "docs"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Grep {
+                context: ContextArgs {
+                    after_context: Some(1),
+                    before_context: Some(2),
+                    context: None,
+                },
+                pattern: "needle".to_string(),
+                path: Some(PathBuf::from("docs")),
             })
         );
     }
@@ -1169,6 +1311,7 @@ mod tests {
                 false,
                 true,
                 "sqlite vector adapter",
+                false,
             )],
             SearchOutputStyle {
                 headings: false,
@@ -1190,6 +1333,7 @@ mod tests {
                 false,
                 true,
                 "Search semantics",
+                false,
             )],
             SearchOutputStyle {
                 headings: false,
@@ -1212,6 +1356,7 @@ mod tests {
                     true,
                     true,
                     "e.g. R0_product_philosophy.md, R1_tech_decision_blabla.md",
+                    false,
                 ),
                 format_search_result(
                     "AGENTS.md",
@@ -1221,8 +1366,18 @@ mod tests {
                     false,
                     true,
                     "Observation flow, from actual implementation, to principle level of intent",
+                    false,
                 ),
-                format_search_result("README.md", 94, 94, false, false, true, "Search semantics"),
+                format_search_result(
+                    "README.md",
+                    94,
+                    94,
+                    false,
+                    false,
+                    true,
+                    "Search semantics",
+                    false,
+                ),
             ],
             SearchOutputStyle {
                 headings: true,
@@ -1233,6 +1388,31 @@ mod tests {
         assert_eq!(
             rendered,
             "AGENTS.md\n[rfv] 4: e.g. R0_product_philosophy.md, R1_tech_decision_blabla.md\n[v] 20: Observation flow, from actual implementation, to principle level of intent\n\nREADME.md\n[v] 94: Search semantics\n"
+        );
+    }
+
+    #[test]
+    fn formatted_search_result_preserves_newlines_for_context_blocks() {
+        let rendered = render_search_hits(
+            &[format_search_result(
+                "notes/alpha.md",
+                7,
+                9,
+                true,
+                false,
+                false,
+                "chunk one\nchunk two\nchunk three",
+                true,
+            )],
+            SearchOutputStyle {
+                headings: false,
+                color: false,
+            },
+        );
+
+        assert_eq!(
+            rendered,
+            "notes/alpha.md:[f] 7-9: chunk one\nchunk two\nchunk three\n"
         );
     }
 }

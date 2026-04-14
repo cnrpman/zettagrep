@@ -6,6 +6,7 @@ use std::path::Path;
 use rusqlite::{Connection, params};
 
 use crate::search;
+use crate::search::SearchContext;
 use crate::{Query, ZgResult};
 
 use super::code_symbols::build_symbol_chunks;
@@ -24,14 +25,24 @@ pub fn search_indexed(
     query: &str,
     limit: usize,
 ) -> ZgResult<Vec<SearchHit>> {
+    search_indexed_with_context(root, scope, query, limit, SearchContext::default())
+}
+
+pub fn search_indexed_with_context(
+    root: &Path,
+    scope: &Path,
+    query: &str,
+    limit: usize,
+    context: SearchContext,
+) -> ZgResult<Vec<SearchHit>> {
     let root = crate::paths::resolve_existing_dir(root)?;
     ensure_index_root(&root)?;
     let conn = open_existing_db(&root)?;
     validate_schema(&conn)?;
 
     match load_index_level(&conn)? {
-        IndexLevel::Fts => search_fts(&root, scope, query, limit),
-        IndexLevel::FtsVector => search_hybrid(&root, scope, query, limit),
+        IndexLevel::Fts => search_fts_with_context(&root, scope, query, limit, context),
+        IndexLevel::FtsVector => search_hybrid_with_context(&root, scope, query, limit, context),
     }
 }
 
@@ -40,6 +51,16 @@ pub fn search_fts(
     scope: &Path,
     query: &str,
     limit: usize,
+) -> ZgResult<Vec<SearchHit>> {
+    search_fts_with_context(root, scope, query, limit, SearchContext::default())
+}
+
+pub fn search_fts_with_context(
+    root: &Path,
+    scope: &Path,
+    query: &str,
+    limit: usize,
+    context: SearchContext,
 ) -> ZgResult<Vec<SearchHit>> {
     let root = crate::paths::resolve_existing_dir(root)?;
     ensure_index_root(&root)?;
@@ -55,7 +76,7 @@ pub fn search_fts(
     let lexical_rows = lexical_candidates(&conn, &root, &scope, &normalized)?;
     let literal_rows = literal_candidates(&conn, &root, &scope, query.trim())?;
     let hits = merge_ranked_hits(lexical_rows, literal_rows, Vec::new());
-    let mut hits = materialize_live_snippets(&root, hits);
+    let mut hits = materialize_live_snippets(&root, hits, context);
     hits.truncate(limit);
     Ok(hits)
 }
@@ -65,6 +86,16 @@ pub fn search_hybrid(
     scope: &Path,
     query: &str,
     limit: usize,
+) -> ZgResult<Vec<SearchHit>> {
+    search_hybrid_with_context(root, scope, query, limit, SearchContext::default())
+}
+
+pub fn search_hybrid_with_context(
+    root: &Path,
+    scope: &Path,
+    query: &str,
+    limit: usize,
+    context: SearchContext,
 ) -> ZgResult<Vec<SearchHit>> {
     let root = crate::paths::resolve_existing_dir(root)?;
     ensure_index_root(&root)?;
@@ -82,7 +113,7 @@ pub fn search_hybrid(
     let literal_rows = literal_candidates(&conn, &root, &scope, query.trim())?;
     let vector_rows = vector_candidates(&conn, &root, &scope, &query_vector)?;
     let hits = merge_ranked_hits(lexical_rows, literal_rows, vector_rows);
-    let hits = materialize_live_snippets(&root, hits);
+    let hits = materialize_live_snippets(&root, hits, context);
     let mut hits = limit_semantic_only_hits(hits);
     hits.truncate(limit);
     Ok(hits)
@@ -529,7 +560,11 @@ fn rg_hit_rel_path(root: &Path, path: &Path) -> Option<String> {
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
 }
 
-fn materialize_live_snippets(root: &Path, mut hits: Vec<SearchHit>) -> Vec<SearchHit> {
+fn materialize_live_snippets(
+    root: &Path,
+    mut hits: Vec<SearchHit>,
+    context: SearchContext,
+) -> Vec<SearchHit> {
     let mut by_path = HashMap::<String, Vec<usize>>::new();
     for (idx, hit) in hits.iter().enumerate() {
         by_path.entry(hit.rel_path.clone()).or_default().push(idx);
@@ -541,12 +576,15 @@ fn materialize_live_snippets(root: &Path, mut hits: Vec<SearchHit>) -> Vec<Searc
         let body = fs::read(&file_path)
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok());
+        let mut text_chunks = None;
+        let mut symbol_chunks = None;
 
         for hit_idx in hit_indexes {
             if let (Some(line_number), Some(preview)) = (
                 hits[hit_idx].literal_line_number,
                 hits[hit_idx].literal_preview.clone(),
-            ) {
+            ) && !context.has_context()
+            {
                 hits[hit_idx].snippet = preview;
                 hits[hit_idx].line_start = line_number;
                 hits[hit_idx].line_end = line_number;
@@ -558,19 +596,38 @@ fn materialize_live_snippets(root: &Path, mut hits: Vec<SearchHit>) -> Vec<Searc
                 continue;
             };
             let chunks = if hits[hit_idx].chunk_kind == "symbol" {
-                build_symbol_chunks(&file_path, body)
+                symbol_chunks.get_or_insert_with(|| build_symbol_chunks(&file_path, body))
             } else {
-                let Ok(chunks) = build_chunks(body) else {
-                    continue;
-                };
-                chunks
+                text_chunks.get_or_insert_with(|| build_chunks(body).unwrap_or_default())
             };
-            let Some(chunk) = chunks.get(hits[hit_idx].chunk_index) else {
+            if chunks.get(hits[hit_idx].chunk_index).is_none() {
+                if let (Some(line_number), Some(preview)) = (
+                    hits[hit_idx].literal_line_number,
+                    hits[hit_idx].literal_preview.clone(),
+                ) {
+                    hits[hit_idx].snippet = preview;
+                    hits[hit_idx].line_start = line_number;
+                    hits[hit_idx].line_end = line_number;
+                    keep[hit_idx] = true;
+                }
                 continue;
             };
-            hits[hit_idx].snippet = render_snippet(&chunk.raw_text);
-            hits[hit_idx].line_start = chunk.line_start;
-            hits[hit_idx].line_end = chunk.line_end;
+            let (start_idx, end_idx) = if context.has_context() {
+                (
+                    hits[hit_idx].chunk_index.saturating_sub(context.before),
+                    usize::min(hits[hit_idx].chunk_index + context.after, chunks.len() - 1),
+                )
+            } else {
+                (hits[hit_idx].chunk_index, hits[hit_idx].chunk_index)
+            };
+            let snippet = chunks[start_idx..=end_idx]
+                .iter()
+                .map(|item| render_snippet(&item.raw_text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            hits[hit_idx].snippet = snippet;
+            hits[hit_idx].line_start = chunks[start_idx].line_start;
+            hits[hit_idx].line_end = chunks[end_idx].line_end;
             keep[hit_idx] = true;
         }
     }
@@ -676,6 +733,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::search::SearchContext;
 
     use super::{
         MAX_SEMANTIC_ONLY_HITS_WITH_LEXICAL, MIN_VECTOR_SCORE_FOR_MERGE, SearchHit, StoredChunk,
@@ -1148,11 +1207,55 @@ mod tests {
             language: None,
         }];
 
-        let hits = materialize_live_snippets(&root, hits);
+        let hits = materialize_live_snippets(&root, hits, SearchContext::default());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line_start, 2);
         assert_eq!(hits[0].line_end, 2);
         assert_eq!(hits[0].snippet, "needle exact line");
+    }
+
+    #[test]
+    fn materialize_live_snippets_uses_neighboring_chunks_for_context() {
+        let root = temp_dir("materialize-context-chunks");
+        let file = root.join("alpha.md");
+        fs::write(
+                &file,
+                "first line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nneedle line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nthird line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+            )
+            .unwrap();
+
+        let hits = vec![SearchHit {
+            rel_path: "alpha.md".to_string(),
+            snippet: String::new(),
+            line_start: 999,
+            line_end: 999,
+            score: 1.0,
+            lexical_score: 1.0,
+            vector_score: 0.0,
+            indexed_text_match: true,
+            partial_text_match: false,
+            literal_line_number: None,
+            literal_preview: None,
+            chunk_index: 1,
+            chunk_kind: "text".to_string(),
+            language: None,
+        }];
+
+        let hits = materialize_live_snippets(
+            &root,
+            hits,
+            SearchContext {
+                before: 1,
+                after: 1,
+            },
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line_start, 1);
+        assert_eq!(hits[0].line_end, 3);
+        assert_eq!(
+            hits[0].snippet,
+            "first line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nneedle line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nthird line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        );
     }
 
     #[test]
@@ -1175,7 +1278,7 @@ mod tests {
             language: None,
         }];
 
-        let hits = materialize_live_snippets(&root, hits);
+        let hits = materialize_live_snippets(&root, hits, SearchContext::default());
         assert!(hits.is_empty());
     }
 }

@@ -15,13 +15,12 @@ If a query looks like regex, `zg` behaves like grep. If it does not, `zg` uses a
 
 - `zg <pattern-or-query> [path]`
 - `zg grep <pattern> [path]`
-- `zg search <query> [path]`
-- `zg index init [--level fts|fts+vector] [path]`
+- `zg index init [--level fts|fts+vector] [--force] [path]`
 - `zg index status [path]`
 - `zg index rebuild [--level fts|fts+vector] [path]`
 - `zg index delete [path]`
 
-Most users should live on `zg <query> [path]`. The subcommands mainly make the mode explicit.
+Most users should live on `zg <query> [path]`. `zg grep` is the explicit regex path; index subcommands are for setup and diagnostics.
 
 ## Build And Run
 
@@ -31,7 +30,7 @@ Requirements:
 
 - Rust `1.85` or newer
 - Cargo
-- `rg` (`ripgrep`) available at runtime, either from `PATH`, `ZG_RG_BIN`, or a bundled binary next to `zg`
+- `rg` (`ripgrep`) available at runtime for both regex search and indexed search, either from `PATH`, `ZG_RG_BIN`, or a bundled binary next to `zg`
 
 Build a debug binary:
 
@@ -82,10 +81,12 @@ This section keeps short, user-facing answers to the questions most people ask f
   Regex search works immediately. Plain-text search still requires an explicit `.zg/` index; if none exists, `zg` tells you to run `zg index init`.
 - Will `zg` change my files?
   It does not rewrite your documents. When you run `zg index init`, it creates a visible `.zg/` directory for indexing and, for `fts+vector`, may download the embedding model into the normal fastembed / Hugging Face cache.
+- Why would `zg index init` ask for `--force`?
+  `zg` estimates chunk count before a new index build. If the target is more than 10x above the recommended chunk range for the selected level, `init` stops and asks you to rerun with `--force` as a sanity check.
 - Can I remove the index later?
   Yes. Run `zg index delete [path]` to remove the local `.zg/` directory for that scope.
 - What search algorithm does the index use?
-  `fts` uses SQLite FTS5 only. `fts+vector` uses hybrid recall: SQLite FTS5 handles keyword recall, vector search uses cosine similarity, and results are merged so exact wording and semantic similarity can both surface.
+  `fts` uses a text channel that combines SQLite FTS5 lexical recall with ripgrep fixed-string literal recall. `fts+vector` keeps that text channel and adds vector recall, so exact wording and semantic similarity can both surface.
 - What embedding model does it use?
   It currently uses `fastembed` with the built-in `ParaphraseMLMiniLML12V2Q` model.
 - How does chunking work?
@@ -95,8 +96,8 @@ This section keeps short, user-facing answers to the questions most people ask f
 
 - Regex is ground truth. Regex-shaped input always keeps regex semantics, even inside an indexed tree.
 - `zg grep` never requires an index.
-- Plain-text search requires an explicit ancestor `.zg/` root.
-- `zg search` uses the nearest ancestor `.zg/` root.
+- Plain-text search requires an explicit ancestor `.zg/` root and currently still depends on `rg` for fixed-string literal recall.
+- The plain-text branch of `zg <query>` uses the nearest ancestor `.zg/` root.
 - Indexed search still reconciles dirty, changed, new, or deleted content lazily at search time, but it does not create a new `.zg/` root for you.
 - `zg index init --level fts` creates a lexical-only index.
 - `zg index init --level fts+vector` creates a hybrid lexical + vector index.
@@ -106,13 +107,14 @@ This section keeps short, user-facing answers to the questions most people ask f
 - Choose `fts` when your workload is mostly keyword, symbol, identifier, path, or exact-phrase lookup and you want the lowest-latency default.
 - Choose `fts+vector` when you want natural-language or semantic recall and are willing to pay more build and query cost.
 - Start with `fts` by default. Upgrade later with `zg index rebuild --level fts+vector <path>` when the directory is small enough and semantic recall is worth it.
+- Very large first-time indexes require `--force`: `fts` above 30,000 estimated chunks, `fts+vector` above 10,240 estimated chunks.
 
 Examples:
 
 ```bash
 zg 'TODO|FIXME' .
 zg "sqlite adapter" notes/
-zg search "meeting notes" docs/
+zg "meeting notes" docs/
 zg index status docs/
 ```
 
@@ -121,12 +123,14 @@ zg index status docs/
 - `zg` is meant to feel familiar to users coming from `grep`, `ripgrep`, `ag`, or `find`.
 - There is no separate command to learn before `zg <query> [path]` becomes useful.
 - Operational notes stay non-blocking. Search does not pause for setup prompts or interactive maintenance flows.
-- The surface stays small. Indexed search is implemented in `zg`; regex search delegates to a runtime `rg` dependency.
+- The surface stays small. Search stays user-facing in `zg`, but the current runtime search stack depends on `rg`: regex search delegates directly, and indexed search also uses ripgrep-backed literal recall.
 
-## Regex Backend
+## Ripgrep Runtime Dependency
 
-`zg grep` and the regex-shaped branch of `zg <query>` delegate matching to
-`rg`.
+`zg` currently requires `rg` at runtime across the whole search surface.
+`zg grep` and the regex-shaped branch of `zg <query>` delegate matching to `rg`
+directly, and indexed search also uses ripgrep-backed fixed-string literal
+recall.
 
 `zg` resolves the `rg` binary in this order:
 
@@ -247,7 +251,7 @@ upstream stack. The main knobs are:
 For local development:
 
 ```bash
-cargo run -- search "sqlite adapter" .
+cargo run -- "sqlite adapter" .
 ```
 
 ## TODO

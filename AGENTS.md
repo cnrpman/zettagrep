@@ -4,6 +4,7 @@
 		- e.g. R0_product_philosophy.md, R1_tech_decision_blabla.md
 		- where R* represents Rank, higher rank (smaller number) the more "truth" (aligned with the "good" taste from product owner / user), while lower rank (bigger number) the more "AI slop" (some non-verified AI generated item)
 	- All documents could be stale, except R0, which means the owner / user must maintain it carefully. Bigger number, bigger hallucination.
+	- Unless the user clearly asks otherwise, keep documentation clean, concise and minimal-entropy. Prefer concise, well-curated in-place edits over chaotic running-log style or additive changelog-like sprawl.
 	- Maintain comments & docstring in codebase for:
 		- Hard-to-understand code
 		- likely reuse code, for development experience
@@ -21,3 +22,4 @@
 	- Agent write most Unit-testings during coding
 	- (High Rank) Documents -> Behavior testings (LLM + CLI) / E2E
 	- Try to consolidate each time an observation happens into the testings above if applicable & non-trivial
+	- logseq.order-list-type:: number

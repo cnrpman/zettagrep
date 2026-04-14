@@ -6,11 +6,12 @@ Date: 2026-04-12
 ## Goal
 
 Ship `zg` on macOS via Homebrew for both Apple Silicon and Intel while keeping
-regex-path behavior aligned with upstream `rg`.
+`ripgrep` as a first-class runtime dependency for the whole search surface and
+keeping regex-path behavior aligned with upstream `rg`.
 
 ## Runtime Dependency Policy
 
-- `zg` depends on `ripgrep` at runtime for regex search
+- `zg` depends on `ripgrep` at runtime for both regex search and indexed search
 - Homebrew formula should declare `depends_on "ripgrep"`
 - `zg` itself also supports a bundled `rg` binary for standalone tarball-style distributions
 
@@ -42,5 +43,5 @@ It is currently a `head` formula and already declares:
 ## Packaging Notes
 
 - Homebrew bottles are built per architecture; do not try to make one universal bottle by hand
-- `depends_on "ripgrep"` is the correct Homebrew-level declaration for both Intel and Apple Silicon
+- `depends_on "ripgrep"` is the correct Homebrew-level declaration for both Intel and Apple Silicon because `rg` is required for the full search surface, not only the regex path
 - If we also ship standalone tarballs, copy `rg` beside `zg` or into `libexec/rg`

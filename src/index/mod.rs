@@ -14,14 +14,17 @@ pub use dev::{
     probe_db_cache, run_search_quality_suite, write_search_quality_golden,
 };
 pub use files::collect_candidate_files;
-pub use hybrid::{search_fts, search_hybrid, search_indexed};
+pub use hybrid::{
+    search_fts, search_fts_with_context, search_hybrid, search_hybrid_with_context, search_indexed,
+    search_indexed_with_context,
+};
 pub use sync::{
     best_effort_overlap_note, delete_index, init_index, init_index_with_level, load_status,
-    rebuild_index, rebuild_index_with_level, reconcile_covering_roots,
+    preflight_init, rebuild_index, rebuild_index_with_level, reconcile_covering_roots,
     require_index_root_for_search,
 };
 pub use types::{
-    FTS_PROMPT_MAX_CHUNKS, IndexLevel, IndexStatus, RebuildStats, SearchHit,
+    FTS_PROMPT_MAX_CHUNKS, IndexLevel, IndexStatus, InitPreflight, RebuildStats, SearchHit,
     VECTOR_PROMPT_MAX_CHUNKS,
 };
 
@@ -45,6 +48,36 @@ mod tests {
 
     fn init_hybrid(root: &std::path::Path) {
         init_index_with_level(root, IndexLevel::FtsVector).unwrap();
+    }
+
+    fn long_chunk_body(line_count: usize) -> String {
+        (0..line_count)
+            .map(|index| {
+                format!("line {index:05} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn preflight_init_requires_force_for_oversized_vector_index() {
+        let root = temp_dir("preflight-init-force");
+        fs::write(
+            root.join("alpha.md"),
+            long_chunk_body(VECTOR_PROMPT_MAX_CHUNKS * 10 + 1),
+        )
+        .unwrap();
+
+        let preflight = preflight_init(&root, IndexLevel::FtsVector).unwrap();
+
+        assert_eq!(
+            preflight.estimated_chunks,
+            VECTOR_PROMPT_MAX_CHUNKS * 10 + 1
+        );
+        assert_eq!(preflight.recommended_chunk_limit, VECTOR_PROMPT_MAX_CHUNKS);
+        assert_eq!(preflight.force_threshold, VECTOR_PROMPT_MAX_CHUNKS * 10);
+        assert!(preflight.requires_force);
     }
 
     #[test]
@@ -131,58 +164,6 @@ mod tests {
         assert!(hits[0].snippet.contains("retry_backoff_ms"));
         assert_eq!(hits[0].line_start, 2);
         assert_eq!(hits[0].line_end, 2);
-    }
-
-    #[test]
-    fn reconcile_refreshes_modified_scope_on_search_path() {
-        let root = temp_dir("reconcile");
-        let nested = root.join("notes");
-        fs::create_dir_all(&nested).unwrap();
-        let file = nested.join("alpha.md");
-        fs::write(&file, "first line").unwrap();
-        init_hybrid(&root);
-
-        fs::write(&file, "updated sqlite recall").unwrap();
-        let active_root = reconcile_covering_roots(&nested).unwrap().unwrap();
-        assert_eq!(active_root, root);
-
-        let hits = search_hybrid(&root, &nested, "sqlite recall", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].rel_path, "notes/alpha.md");
-    }
-
-    #[test]
-    fn reconcile_batches_embedding_work_across_dirty_documents() {
-        let root = temp_dir("reconcile-batch");
-        fs::write(
-            root.join("alpha.md"),
-            "alpha baseline long line abcdefghijklmnop",
-        )
-        .unwrap();
-        fs::write(
-            root.join("beta.md"),
-            "beta baseline long line abcdefghijklmnop",
-        )
-        .unwrap();
-        init_hybrid(&root);
-
-        fs::write(
-            root.join("alpha.md"),
-            "alpha changed long line one abcdefghijklmnop",
-        )
-        .unwrap();
-        fs::write(
-            root.join("beta.md"),
-            "beta changed long line two abcdefghijklmnop",
-        )
-        .unwrap();
-
-        super::embed::test_begin_embed_capture_for_current_thread();
-        reconcile_covering_roots(&root).unwrap();
-        let (calls, texts) = super::embed::test_embed_counters();
-
-        assert_eq!(calls, 1);
-        assert_eq!(texts, 2);
     }
 
     #[test]

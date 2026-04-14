@@ -13,6 +13,7 @@ pub(crate) const DEFAULT_SCOPE_POLICY: &str =
     "document suffix + supported code language whitelist + encoding/character whitelist";
 pub(crate) const DEFAULT_VECTOR_PROVIDER: &str = "fastembed-ParaphraseMLMiniLML12V2Q";
 pub(crate) const DEFAULT_INDEX_LEVEL: IndexLevel = IndexLevel::Fts;
+pub(crate) const INIT_SANITY_CHECK_MULTIPLIER: usize = 10;
 pub const FTS_PROMPT_MAX_CHUNKS: usize = 3_000;
 // Vector prompt gating is based on steady-state embedding throughput after model
 // initialization, not on cold-start wall time for a fresh CLI process.
@@ -40,6 +41,14 @@ pub struct RebuildStats {
     pub chunks_indexed: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitPreflight {
+    pub estimated_chunks: usize,
+    pub recommended_chunk_limit: usize,
+    pub force_threshold: usize,
+    pub requires_force: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum IndexLevel {
     #[serde(rename = "fts")]
@@ -59,6 +68,18 @@ impl IndexLevel {
     pub(crate) fn vectors_enabled(self) -> bool {
         matches!(self, Self::FtsVector)
     }
+
+    pub(crate) fn recommended_chunk_limit(self) -> usize {
+        match self {
+            Self::Fts => FTS_PROMPT_MAX_CHUNKS,
+            Self::FtsVector => VECTOR_PROMPT_MAX_CHUNKS,
+        }
+    }
+
+    pub(crate) fn init_force_chunk_limit(self) -> usize {
+        self.recommended_chunk_limit()
+            .saturating_mul(INIT_SANITY_CHECK_MULTIPLIER)
+    }
 }
 
 impl std::fmt::Display for IndexLevel {
@@ -76,6 +97,12 @@ impl FromStr for IndexLevel {
             "fts+vector" => Ok(Self::FtsVector),
             _ => Err("expected `fts` or `fts+vector`"),
         }
+    }
+}
+
+impl IndexStatus {
+    pub fn index_level_known(&self) -> bool {
+        self.index_level_known
     }
 }
 
@@ -103,6 +130,8 @@ pub struct IndexStatus {
     pub index_root: Option<PathBuf>,
     pub indexed: bool,
     pub index_level: IndexLevel,
+    #[serde(skip)]
+    pub(crate) index_level_known: bool,
     pub chunk_mode: String,
     pub chunk_marker: String,
     pub scope_policy: String,
@@ -179,16 +208,16 @@ pub(crate) struct StoredChunk {
     pub(crate) literal_preview: Option<String>,
 }
 
-#[derive(Serialize)]
-pub(crate) struct StateMirror {
+#[derive(Clone, Serialize)]
+pub(crate) struct StateSnapshot {
     pub(crate) schema_version: u32,
     pub(crate) index_root: String,
     pub(crate) indexed: bool,
-    pub(crate) index_level: &'static str,
-    pub(crate) chunk_mode: &'static str,
-    pub(crate) chunk_marker: &'static str,
-    pub(crate) scope_policy: &'static str,
-    pub(crate) walk_policy: &'static str,
+    pub(crate) index_level: String,
+    pub(crate) chunk_mode: String,
+    pub(crate) chunk_marker: String,
+    pub(crate) scope_policy: String,
+    pub(crate) walk_policy: String,
     pub(crate) dirty: bool,
     pub(crate) dirty_reason: Option<String>,
     pub(crate) last_sync_unix_ms: Option<u64>,

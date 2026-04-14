@@ -10,10 +10,10 @@ use crate::paths;
 
 use super::db::{
     create_schema, delete_by_rel_path, ensure_index_root, gc_unreferenced_shared_chunks,
-    load_file_rows_for_scope, load_index_level, load_state, load_state_mirror_status, mark_dirty,
+    load_file_rows_for_scope, load_index_level, load_state, load_state_snapshot_status, mark_dirty,
     open_existing_db, open_or_create_db, prepare_missing_shared_chunk_vectors, reset_schema,
     seed_defaults, set_dirty_state, set_index_level, status_for_index_root, upsert_document,
-    validate_schema, with_write_transaction_retry, write_state_mirror,
+    validate_schema, with_write_transaction_retry, write_state_snapshot,
 };
 use super::files::{
     collect_candidate_files, collect_scope_candidates, estimate_indexable_chunks,
@@ -21,7 +21,7 @@ use super::files::{
 };
 use super::types::{
     DEFAULT_INDEX_LEVEL, FTS_PROMPT_MAX_CHUNKS, IndexLevel, IndexStatus, IndexedDocument,
-    RebuildStats, StateRow, SyncStats, VECTOR_PROMPT_MAX_CHUNKS,
+    InitPreflight, RebuildStats, StateRow, SyncStats, VECTOR_PROMPT_MAX_CHUNKS,
 };
 use super::util::{
     ancestor_index_root, descendant_index_root, modified_unix_ms, now_unix_ms, relative_path_string,
@@ -29,6 +29,20 @@ use super::util::{
 
 pub fn init_index(root: &Path) -> ZgResult<RebuildStats> {
     init_index_with_level(root, DEFAULT_INDEX_LEVEL)
+}
+
+pub fn preflight_init(root: &Path, index_level: IndexLevel) -> ZgResult<InitPreflight> {
+    let root = paths::resolve_existing_dir(root)?;
+    let estimate = estimate_indexable_chunks(&root)?;
+    let recommended_chunk_limit = index_level.recommended_chunk_limit();
+    let force_threshold = index_level.init_force_chunk_limit();
+
+    Ok(InitPreflight {
+        estimated_chunks: estimate.chunk_count,
+        recommended_chunk_limit,
+        force_threshold,
+        requires_force: estimate.chunk_count > force_threshold,
+    })
 }
 
 pub fn init_index_with_level(root: &Path, index_level: IndexLevel) -> ZgResult<RebuildStats> {
@@ -39,7 +53,7 @@ pub fn init_index_with_level(root: &Path, index_level: IndexLevel) -> ZgResult<R
     create_schema(&conn)?;
     seed_defaults(&conn)?;
     set_index_level(&conn, index_level)?;
-    write_state_mirror(&root, &status_for_index_root(&root)?)?;
+    write_state_snapshot(&root, &status_for_index_root(&root)?)?;
 
     rebuild_index_with_level(&root, Some(index_level))
 }
@@ -192,7 +206,7 @@ pub fn rebuild_index_with_level(
         Ok(())
     })?;
 
-    write_state_mirror(&root, &status_for_index_root(&root)?)?;
+    write_state_snapshot(&root, &status_for_index_root(&root)?)?;
 
     Ok(RebuildStats {
         scanned_files: candidate_files.len(),
@@ -242,13 +256,13 @@ pub fn load_status(path: &Path) -> ZgResult<IndexStatus> {
                     error.to_string()
                 };
                 mark_dirty(&root, &dirty_reason)?;
-                let mut status = load_state_mirror_status(&requested_path, Some(root.clone()));
+                let mut status = load_state_snapshot_status(&requested_path, Some(root.clone()));
                 status.dirty = true;
                 status.dirty_reason = Some(dirty_reason);
                 Ok(status)
             }
         },
-        None => Ok(load_state_mirror_status(&requested_path, None)),
+        None => Ok(load_state_snapshot_status(&requested_path, None)),
     }
 }
 
@@ -381,7 +395,7 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
         })?;
     }
 
-    write_state_mirror(&root, &status_for_index_root(&root)?)?;
+    write_state_snapshot(&root, &status_for_index_root(&root)?)?;
     Ok(stats)
 }
 

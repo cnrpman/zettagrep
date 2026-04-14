@@ -19,10 +19,11 @@
 
 - regex 是地面真相;像 regex 的输入永远按 regex 语义执行。
 - 非 regex 搜索要求祖先链上已经存在显式建立的 `.zg`;如果不存在,系统应直接返回可执行的错误,提示用户先运行 `zg index init`。
+- `rg` 是全局 runtime dependency,不是只给 regex path 用的外挂。regex search 直接委托给 `rg`;indexed search 也依赖 ripgrep fixed-string literal recall。
 - indexed search 只有两个 level:`fts` 与 `fts+vector`。
 - 非 regex 搜索的 text channel 不只来自数据库 lexical index;它还应并入 ripgrep fixed-string literal recall,保证用户已经习惯的字面命中在 indexed search 里仍然可见。
 - non-regex plain query 的 `r` 通道应继承 plain query 的大小写语义:默认大小写不敏感,不能因为底层用了 ripgrep literal recall 就突然退化成大小写敏感。
-- regex 仍然是独立路径;plain query 结果里不混入 regex recall,只有 index text / partial literal / semantic 三类来源。
+- 虽然 `rg` 是共享 runtime dependency,regex 仍然是独立路径;plain query 结果里不混入 regex recall,只有 index text / partial literal / semantic 三类来源。
 - `fts` 是 text-only 路径,用于低延迟、低成本的默认索引;这里的 text 指 indexed lexical recall 与 ripgrep literal recall 的并集。
 - `fts+vector` 是 hybrid recall:text 与 embedding 信号并列参与召回,text 召回不得被向量分数淹没或隐藏,向量也不是可有可无的 rerank 附件。具体融合方式属于内部实现,可以演进,但这条语义承诺不能退化。
 - 展示层应区分 `f`(来自 index lexical / FTS)、`r`(来自 ripgrep fixed-string literal recall)、`v`(来自向量召回);如果一个结果同时吃到多个来源,标签应明确表达组合关系,例如 `[rfv]`,不能把不同来源混成一个模糊标签。
@@ -63,6 +64,7 @@
 - 当前 chunking 先使用固定默认值;用户应能在 `status` 中看见当前逻辑,但不追求把它做成一堆配置项。
 - 默认 chunking 按回车切分,并支持行内硬切分标记。
 - 默认行内硬切分标记是 ` :: `;索引和结果展示都不保留该标记本身。
+- 凡是基于 chunk 数的提示、门槛、sanity check 或 level 建议,都必须以真实 chunking 结果为准,不能退化成基于行数、字节数或其他近似信号的估算。性能优化只能通过复用这次精确 chunking 的结果、或消除与它无关的额外扫描来实现,不能靠降低估算精度换速度。
 - chunk 存储同时保留 raw text 和 normalized text。
 - 对笔记常见的行首装饰符可做轻量清洗,但不能破坏正文语义。
 
@@ -82,5 +84,6 @@
 - 打铁还需自身硬:产品质量是一切增长的前提,迁移成本低的前提是 zg 本身值得被迁移过来
 - 迁移成本必须接近零:从 ripgrep / grep / ag / find 等既有工具过来的用户,不需要学习新的查询语法就能用 `zg <query> [path]` 得到合理结果。
 - 常见 flag 的语义要尽量贴合既有习惯;如果一个 flag 在 ripgrep 里意味着 X,zg 的同名 flag 不应意味着非 X。无法对齐时,宁可不提供该 flag,也不要提供一个语义冲突的同名 flag。
+- 除显式的 index 管理语义外,面向搜索的 CLI 兼容目标默认以 `rg` 为基线:参数位置、同名 flag 语义、输出约定、exit code 与 help/usage 心智都应尽量贴近 `rg`;新增搜索 flag 时,默认先问“如果用户把 zg 当 rg 用,这里会不会惊讶?”
 - regex 是地面真相这一条本身就是迁移承诺的一部分:它保证从 grep 系工具过来的用户,最熟悉的那条路径在 zg 里永远可用、永远按预期工作。
 - 无索引场景里,regex 仍然必须是一等公民。对非 regex 搜索,系统可以要求用户先显式执行 `zg index init`;关键是错误必须直接、可执行、低歧义。

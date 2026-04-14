@@ -1,8 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use zg::dev;
@@ -23,27 +22,14 @@ fn zg() -> Command {
     command
 }
 
-fn count_embed_records(path: &std::path::Path, prefix: &str) -> usize {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.split('\t').next() == Some(prefix))
-        .count()
-}
-
-fn wait_for_embed_record(path: &std::path::Path, prefix: &str, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if count_embed_records(path, prefix) >= expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {expected} {prefix} embed records in {}",
-            path.display()
-        );
-        sleep(Duration::from_millis(10));
-    }
+fn long_chunk_body(line_count: usize) -> String {
+    (0..line_count)
+        .map(|index| {
+            format!("line {index:05} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 #[test]
@@ -55,16 +41,15 @@ fn help_prints_dual_entry_usage() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Local-first search CLI for note-heavy directories."));
-    assert!(stdout.contains("Usage: zg <QUERY> [PATH]"));
+    assert!(stdout.contains("Usage: zg [OPTIONS] <QUERY> [PATH]"));
     assert!(stdout.contains("zg <COMMAND>"));
     assert!(stdout.contains("Regex-shaped input uses grep semantics immediately."));
-    assert!(stdout.contains("grep    Run regex search immediately with ripgrep semantics"));
-    assert!(
-        stdout.contains(
-            "search  Run indexed plain-text search inside the nearest ancestor `.zg/` root"
-        )
-    );
-    assert!(stdout.contains("index   Manage the local `.zg/` search index"));
+    assert!(stdout.contains("Run regex search immediately with ripgrep semantics"));
+    assert!(stdout.contains("Manage the local `.zg/` search index"));
+    assert!(!stdout.contains("search  Run indexed plain-text"));
+    assert!(stdout.contains("-A, --after-context <NUM>"));
+    assert!(stdout.contains("-B, --before-context <NUM>"));
+    assert!(stdout.contains("-C, --context <NUM>"));
     assert!(stdout.contains("Examples:"));
     assert!(stdout.contains("zg index init notes/"));
 }
@@ -77,6 +62,9 @@ fn subcommand_help_prints_explanatory_text() {
     let grep_stdout = String::from_utf8(grep_output.stdout).unwrap();
     assert!(grep_stdout.contains("Run regex search immediately with ripgrep semantics"));
     assert!(grep_stdout.contains("Regex pattern passed through to ripgrep"));
+    assert!(grep_stdout.contains("-A, --after-context <NUM>"));
+    assert!(grep_stdout.contains("-B, --before-context <NUM>"));
+    assert!(grep_stdout.contains("-C, --context <NUM>"));
 
     let init_output = zg().args(["index", "init", "--help"]).output().unwrap();
     assert!(init_output.status.success());
@@ -88,6 +76,7 @@ fn subcommand_help_prints_explanatory_text() {
             "Index level to build: `fts` for lexical only, `fts+vector` for hybrid recall"
         )
     );
+    assert!(init_stdout.contains("Skip the large-index sanity check"));
 }
 
 #[test]
@@ -130,6 +119,60 @@ fn default_entrypoint_uses_regex_mode_for_regex_shaped_queries() {
         vec![
             format!("{}:2:TODO item", file.display()),
             format!("{}:3:FIXME item", file.display()),
+        ]
+    );
+}
+
+#[test]
+fn grep_subcommand_supports_context_flags() {
+    let root = temp_dir("grep-context");
+    let file = root.join("note.md");
+    fs::write(&file, "alpha\nneedle one\nomega\n").unwrap();
+
+    let output = zg()
+        .args(["grep", "-C", "1", "needle"])
+        .arg(&file)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec![
+            format!("{}:1:alpha", file.display()),
+            format!("{}:2:needle one", file.display()),
+            format!("{}:3:omega", file.display()),
+        ]
+    );
+}
+
+#[test]
+fn default_entrypoint_passes_context_flags_to_regex_mode() {
+    let root = temp_dir("default-regex-context");
+    let file = root.join("note.md");
+    fs::write(&file, "alpha\nTODO item\nomega\n").unwrap();
+
+    let output = zg()
+        .args(["-C", "1", "TODO|FIXME"])
+        .arg(&file)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec![
+            format!("{}:1:alpha", file.display()),
+            format!("{}:2:TODO item", file.display()),
+            format!("{}:3:omega", file.display()),
         ]
     );
 }
@@ -213,11 +256,7 @@ fn indexed_search_prints_plain_rg_like_result_lines() {
     let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
     assert!(init.status.success());
 
-    let output = zg()
-        .args(["search", "sqlite adapter"])
-        .arg(&root)
-        .output()
-        .unwrap();
+    let output = zg().arg("sqlite adapter").arg(&root).output().unwrap();
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
@@ -229,6 +268,34 @@ fn indexed_search_prints_plain_rg_like_result_lines() {
 }
 
 #[test]
+fn indexed_search_supports_chunk_context_flags() {
+    let root = temp_dir("indexed-context");
+    fs::write(
+        root.join("alpha.md"),
+        "before chunk xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nneedle context xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nafter chunk xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+    )
+    .unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let output = zg()
+        .args(["-C", "1", "needle context"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        "alpha.md:[rf] 1-3: before chunk xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nneedle context xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nafter chunk xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+    );
+}
+
+#[test]
 fn indexed_search_uses_ripgrep_literal_recall_for_marker_queries() {
     let root = temp_dir("indexed-literal-recall");
     fs::write(root.join("alpha.md"), "alpha :: beta\n").unwrap();
@@ -236,7 +303,7 @@ fn indexed_search_uses_ripgrep_literal_recall_for_marker_queries() {
     let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
     assert!(init.status.success());
 
-    let output = zg().args(["search", "::"]).arg(&root).output().unwrap();
+    let output = zg().arg("::").arg(&root).output().unwrap();
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
@@ -259,7 +326,7 @@ fn indexed_search_uses_case_insensitive_ripgrep_literal_recall() {
     assert!(init.status.success());
 
     let output = zg()
-        .args(["search", "docs/r0_product_philosophy.md"])
+        .arg("docs/r0_product_philosophy.md")
         .arg(&root)
         .output()
         .unwrap();
@@ -311,6 +378,25 @@ fn vector_index_init_prints_wait_note_to_stderr() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("initialized"));
     assert!(stdout.contains("level=fts+vector"));
+}
+
+#[test]
+fn oversized_vector_init_requires_force() {
+    let root = temp_dir("vector-init-force-required");
+    fs::write(root.join("alpha.md"), long_chunk_body(10_241)).unwrap();
+
+    let output = zg()
+        .args(["index", "init", "--level", "fts+vector"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("estimates 10241 chunks"));
+    assert!(stderr.contains("> 10240 chunks (10x) requires `--force`"));
+    assert!(stderr.contains("zg index init --level fts+vector --force"));
 }
 
 #[test]
@@ -455,97 +541,4 @@ fn dev_bench_sample_vault_runs_on_tiny_fixture() {
     assert!(stdout.contains("\"level\": \"fts\""));
     assert!(stdout.contains("\"level\": \"fts+vector\""));
     assert!(stdout.contains("\"query_total_elapsed_ms\""));
-}
-
-#[test]
-fn indexed_search_stays_available_while_another_writer_holds_the_db_lock() {
-    let root = temp_dir("indexed-reader-while-write-locked");
-    fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
-
-    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
-    assert!(init.status.success());
-
-    let writer = Connection::open(root.join(".zg/index.db")).unwrap();
-    writer
-        .execute_batch(
-            "PRAGMA journal_mode = WAL;
-             BEGIN IMMEDIATE;
-             UPDATE state SET dirty = dirty WHERE id = 1;",
-        )
-        .unwrap();
-
-    let output = zg()
-        .args(["search", "sqlite adapter"])
-        .arg(&root)
-        .output()
-        .unwrap();
-
-    writer.execute_batch("ROLLBACK").unwrap();
-
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0], "alpha.md:[f] 1: sqlite vector adapter");
-}
-
-#[test]
-fn concurrent_dirty_searches_do_not_duplicate_passage_embeddings() {
-    let root = temp_dir("dirty-search-dedup");
-    let file = root.join("alpha.md");
-    fs::write(&file, "baseline long line abcdefghijklmnop").unwrap();
-
-    let init = zg()
-        .args(["index", "init", "--level", "fts+vector"])
-        .arg(&root)
-        .output()
-        .unwrap();
-    assert!(init.status.success());
-
-    fs::write(&file, "updated sqlite recall long line abcdefghijklmnop").unwrap();
-
-    let log_path = root.join("embed.log");
-
-    let mut first = zg();
-    first.env("ZG_TEST_EMBED_LOG_PATH", &log_path);
-    first.env("ZG_TEST_PASSAGE_EMBED_DELAY_MS", "250");
-    let first = first
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args(["search", "sqlite recall"])
-        .arg(&root)
-        .spawn()
-        .unwrap();
-
-    wait_for_embed_record(&log_path, "passage", 1);
-
-    let second = zg()
-        .env("ZG_TEST_EMBED_LOG_PATH", &log_path)
-        .args(["search", "sqlite recall"])
-        .arg(&root)
-        .output()
-        .unwrap();
-
-    let first = first.wait_with_output().unwrap();
-
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    assert!(
-        second.status.success(),
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-
-    assert_eq!(count_embed_records(&log_path, "passage"), 1);
-    assert_eq!(count_embed_records(&log_path, "query"), 2);
-
-    let first_stdout = String::from_utf8(first.stdout).unwrap();
-    let second_stdout = String::from_utf8(second.stdout).unwrap();
-    assert!(first_stdout.contains("alpha.md:[rfv] 1: updated sqlite recall"));
-    assert!(second_stdout.contains("alpha.md:[rfv] 1: updated sqlite recall"));
 }

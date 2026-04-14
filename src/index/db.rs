@@ -18,7 +18,7 @@ use super::embed::embed_passages;
 use super::types::{
     DEFAULT_CHUNK_MARKER, DEFAULT_CHUNK_MODE, DEFAULT_INDEX_LEVEL, DEFAULT_SCOPE_POLICY,
     DEFAULT_VECTOR_PROVIDER, FileRecord, IndexLevel, IndexStatus, IndexedDocument, SCHEMA_VERSION,
-    ScopeKind, StateMirror, StateRow, VECTOR_DIMENSIONS,
+    ScopeKind, StateRow, StateSnapshot, VECTOR_DIMENSIONS,
 };
 use super::util::{now_unix_ms, scope_kind};
 
@@ -372,21 +372,24 @@ pub(crate) fn set_dirty_state(
 }
 
 pub(crate) fn mark_dirty(root: &Path, reason: &str) -> ZgResult<()> {
+    let known_index_level = best_effort_index_level(root)
+        .map(|index_level| index_level.as_str().to_string())
+        .unwrap_or_default();
+
     if let Ok(conn) = open_or_create_db(root) {
         let _ = create_schema(&conn);
-        let _ = seed_defaults(&conn);
         let _ = set_dirty_state(&conn, true, Some(reason), None);
     }
 
-    let mirror = StateMirror {
+    let snapshot = StateSnapshot {
         schema_version: SCHEMA_VERSION,
         index_root: root.display().to_string(),
         indexed: paths::is_indexed_root(root),
-        index_level: DEFAULT_INDEX_LEVEL.as_str(),
-        chunk_mode: DEFAULT_CHUNK_MODE,
-        chunk_marker: DEFAULT_CHUNK_MARKER,
-        scope_policy: DEFAULT_SCOPE_POLICY,
-        walk_policy: DEFAULT_WALK_POLICY,
+        index_level: known_index_level,
+        chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
+        chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
+        scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
+        walk_policy: DEFAULT_WALK_POLICY.to_string(),
         dirty: true,
         dirty_reason: Some(reason.to_string()),
         last_sync_unix_ms: None,
@@ -399,13 +402,13 @@ pub(crate) fn mark_dirty(root: &Path, reason: &str) -> ZgResult<()> {
     };
     fs::write(
         paths::state_path(root),
-        serde_json::to_string_pretty(&mirror)? + "\n",
+        serde_json::to_string_pretty(&snapshot)? + "\n",
     )?;
     Ok(())
 }
 
-pub(crate) fn write_state_mirror(root: &Path, status: &IndexStatus) -> ZgResult<()> {
-    let mirror = StateMirror {
+pub(crate) fn write_state_snapshot(root: &Path, status: &IndexStatus) -> ZgResult<()> {
+    let snapshot = StateSnapshot {
         schema_version: SCHEMA_VERSION,
         index_root: status
             .index_root
@@ -414,11 +417,11 @@ pub(crate) fn write_state_mirror(root: &Path, status: &IndexStatus) -> ZgResult<
             .display()
             .to_string(),
         indexed: status.indexed,
-        index_level: status.index_level.as_str(),
-        chunk_mode: DEFAULT_CHUNK_MODE,
-        chunk_marker: DEFAULT_CHUNK_MARKER,
-        scope_policy: DEFAULT_SCOPE_POLICY,
-        walk_policy: DEFAULT_WALK_POLICY,
+        index_level: status.index_level.as_str().to_string(),
+        chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
+        chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
+        scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
+        walk_policy: DEFAULT_WALK_POLICY.to_string(),
         dirty: status.dirty,
         dirty_reason: status.dirty_reason.clone(),
         last_sync_unix_ms: status.last_sync_unix_ms,
@@ -431,7 +434,7 @@ pub(crate) fn write_state_mirror(root: &Path, status: &IndexStatus) -> ZgResult<
     };
     fs::write(
         paths::state_path(root),
-        serde_json::to_string_pretty(&mirror)? + "\n",
+        serde_json::to_string_pretty(&snapshot)? + "\n",
     )?;
     Ok(())
 }
@@ -906,6 +909,7 @@ pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
         index_root: Some(root.to_path_buf()),
         indexed: true,
         index_level,
+        index_level_known: true,
         chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
         chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
         scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
@@ -922,15 +926,40 @@ pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
     })
 }
 
-pub(crate) fn load_state_mirror_status(
+pub(crate) fn load_state_snapshot_status(
     requested_path: &Path,
     index_root: Option<PathBuf>,
 ) -> IndexStatus {
+    if let Some(root) = index_root.as_deref() {
+        let index_level = best_effort_index_level(root);
+        return IndexStatus {
+            requested_path: requested_path.to_path_buf(),
+            index_root,
+            indexed: true,
+            index_level: index_level.unwrap_or(DEFAULT_INDEX_LEVEL),
+            index_level_known: index_level.is_some(),
+            chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
+            chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
+            scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
+            walk_policy: DEFAULT_WALK_POLICY.to_string(),
+            dirty: false,
+            dirty_reason: None,
+            last_sync_unix_ms: None,
+            file_count: 0,
+            chunk_count: 0,
+            fts_ready: false,
+            vector_ready: false,
+            last_index_run_status: None,
+            last_index_run_duration_ms: None,
+        };
+    }
+
     IndexStatus {
         requested_path: requested_path.to_path_buf(),
+        indexed: index_root.is_some(),
         index_root,
-        indexed: false,
         index_level: DEFAULT_INDEX_LEVEL,
+        index_level_known: false,
         chunk_mode: DEFAULT_CHUNK_MODE.to_string(),
         chunk_marker: DEFAULT_CHUNK_MARKER.to_string(),
         scope_policy: DEFAULT_SCOPE_POLICY.to_string(),
@@ -945,6 +974,11 @@ pub(crate) fn load_state_mirror_status(
         last_index_run_status: None,
         last_index_run_duration_ms: None,
     }
+}
+
+fn best_effort_index_level(root: &Path) -> Option<IndexLevel> {
+    let conn = open_existing_db(root).ok()?;
+    load_index_level(&conn).ok()
 }
 
 fn file_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
