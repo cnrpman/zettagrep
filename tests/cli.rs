@@ -50,8 +50,22 @@ fn help_prints_dual_entry_usage() {
     assert!(stdout.contains("-A, --after-context <NUM>"));
     assert!(stdout.contains("-B, --before-context <NUM>"));
     assert!(stdout.contains("-C, --context <NUM>"));
+    assert!(stdout.contains("-i, --ignore-case"));
+    assert!(stdout.contains("-l, --files-with-matches"));
+    assert!(stdout.contains("-V, --version"));
     assert!(stdout.contains("Examples:"));
     assert!(stdout.contains("zg index init notes/"));
+}
+
+#[test]
+fn version_flag_prints_package_version() {
+    let output = zg().arg("--version").output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
@@ -65,6 +79,8 @@ fn subcommand_help_prints_explanatory_text() {
     assert!(grep_stdout.contains("-A, --after-context <NUM>"));
     assert!(grep_stdout.contains("-B, --before-context <NUM>"));
     assert!(grep_stdout.contains("-C, --context <NUM>"));
+    assert!(grep_stdout.contains("-i, --ignore-case"));
+    assert!(grep_stdout.contains("-l, --files-with-matches"));
 
     let init_output = zg().args(["index", "init", "--help"]).output().unwrap();
     assert!(init_output.status.success());
@@ -175,6 +191,48 @@ fn default_entrypoint_passes_context_flags_to_regex_mode() {
             format!("{}:3:omega", file.display()),
         ]
     );
+}
+
+#[test]
+fn grep_subcommand_supports_ignore_case_for_regex() {
+    let root = temp_dir("grep-ignore-case");
+    let file = root.join("note.md");
+    fs::write(&file, "alpha\nTODO item\nomega\n").unwrap();
+
+    let output = zg()
+        .args(["grep", "-i", "todo"])
+        .arg(&file)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines, vec![format!("{}:2:TODO item", file.display())]);
+}
+
+#[test]
+fn grep_subcommand_files_with_matches_outputs_unique_paths() {
+    let root = temp_dir("grep-files-with-matches");
+    fs::write(root.join("alpha.md"), "needle one\nneedle two\n").unwrap();
+    fs::write(root.join("beta.md"), "needle three\n").unwrap();
+
+    let output = zg()
+        .args(["grep", "-l", "needle"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], root.join("alpha.md").display().to_string());
+    assert_eq!(lines[1], root.join("beta.md").display().to_string());
 }
 
 #[test]
@@ -293,6 +351,25 @@ fn indexed_search_supports_chunk_context_flags() {
         stdout,
         "alpha.md:[rf] 1-3: before chunk xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nneedle context xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nafter chunk xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
     );
+}
+
+#[test]
+fn indexed_search_files_with_matches_outputs_unique_rel_paths() {
+    let root = temp_dir("indexed-files-with-matches");
+    fs::write(root.join("alpha.md"), "needle one\nneedle two\n").unwrap();
+    fs::write(root.join("beta.md"), "needle three\n").unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let output = zg().args(["-l", "needle"]).arg(&root).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines, vec!["alpha.md", "beta.md"]);
 }
 
 #[test]

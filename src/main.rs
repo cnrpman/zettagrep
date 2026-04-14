@@ -22,11 +22,11 @@ enum SearchMode {
 #[derive(Debug, Parser, PartialEq)]
 #[command(
     name = "zg",
+    version,
     about = "Local-first search CLI for note-heavy directories",
     long_about = "Local-first search CLI for note-heavy directories.\n\nRegex-shaped input uses grep semantics immediately. Plain-text search uses an explicit local `.zg/` index.",
     after_help = "Examples:\n  zg 'TODO|FIXME' .\n  zg \"sqlite adapter\" notes/\n  zg index init notes/\n  zg index status notes/",
     disable_help_subcommand = true,
-    disable_version_flag = true,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
@@ -92,6 +92,18 @@ struct ContextArgs {
     before_context: Option<usize>,
     #[arg(short = 'C', long = "context", value_name = "NUM")]
     context: Option<usize>,
+    #[arg(
+        short = 'i',
+        long = "ignore-case",
+        help = "Regex search only; indexed plain-text search already ignores case"
+    )]
+    ignore_case: bool,
+    #[arg(
+        short = 'l',
+        long = "files-with-matches",
+        help = "Print only matching file paths"
+    )]
+    files_with_matches: bool,
 }
 
 impl ContextArgs {
@@ -100,6 +112,14 @@ impl ContextArgs {
             before: self.before_context.or(self.context).unwrap_or(0),
             after: self.after_context.or(self.context).unwrap_or(0),
         }
+    }
+
+    fn ignore_case(&self) -> bool {
+        self.ignore_case
+    }
+
+    fn files_with_matches(&self) -> bool {
+        self.files_with_matches
     }
 }
 
@@ -304,7 +324,12 @@ fn run() -> ZgResult<()> {
 
     match parse_cli_from(args) {
         Ok(cli) => run_cli(cli),
-        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
             print!("{error}");
             Ok(())
         }
@@ -326,16 +351,31 @@ fn run_cli(cli: Cli) -> ZgResult<()> {
             context,
             pattern,
             path,
-        }) => run_grep(&pattern, path.as_deref(), context.resolve()),
+        }) => run_grep(
+            &pattern,
+            path.as_deref(),
+            context.resolve(),
+            context.ignore_case(),
+            context.files_with_matches(),
+        ),
         Some(Commands::Index { command }) => run_index_command(command),
         Some(Commands::Dev { command }) => run_dev_command(command),
         None => {
             let query = cli.query.ok_or_else(|| other("missing query"))?;
             match resolve_search_mode(&query) {
-                SearchMode::Regex => run_grep(&query, cli.path.as_deref(), cli.context.resolve()),
-                SearchMode::Indexed => {
-                    run_search(&query, cli.path.as_deref(), cli.context.resolve())
-                }
+                SearchMode::Regex => run_grep(
+                    &query,
+                    cli.path.as_deref(),
+                    cli.context.resolve(),
+                    cli.context.ignore_case(),
+                    cli.context.files_with_matches(),
+                ),
+                SearchMode::Indexed => run_search(
+                    &query,
+                    cli.path.as_deref(),
+                    cli.context.resolve(),
+                    cli.context.files_with_matches(),
+                ),
             }
         }
     }
@@ -537,9 +577,23 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
     }
 }
 
-fn run_grep(pattern: &str, path: Option<&Path>, context: search::SearchContext) -> ZgResult<()> {
+fn run_grep(
+    pattern: &str,
+    path: Option<&Path>,
+    context: search::SearchContext,
+    ignore_case: bool,
+    files_with_matches: bool,
+) -> ZgResult<()> {
     let root = resolve_path_arg(path)?;
-    let hits = search::regex_search(pattern, &root, context)?
+    let hits = search::regex_search(pattern, &root, context, ignore_case)?;
+    if files_with_matches {
+        print!(
+            "{}",
+            render_matching_paths(hits.into_iter().map(|hit| hit.path.display().to_string()))
+        );
+        return Ok(());
+    }
+    let hits = hits
         .into_iter()
         .map(|hit| RenderedSearchHit {
             path: hit.path.display().to_string(),
@@ -552,11 +606,24 @@ fn run_grep(pattern: &str, path: Option<&Path>, context: search::SearchContext) 
     Ok(())
 }
 
-fn run_search(query: &str, path: Option<&Path>, context: search::SearchContext) -> ZgResult<()> {
+fn run_search(
+    query: &str,
+    path: Option<&Path>,
+    context: search::SearchContext,
+    files_with_matches: bool,
+) -> ZgResult<()> {
     let requested = resolve_path_arg(path)?;
     let root = index::require_index_root_for_search(&requested)?;
     index::reconcile_covering_roots(&requested)?;
-    let hits = index::search_indexed_with_context(&root, &requested, query, 20, context)?;
+    let search_limit = if files_with_matches { usize::MAX } else { 20 };
+    let hits = index::search_indexed_with_context(&root, &requested, query, search_limit, context)?;
+    if files_with_matches {
+        print!(
+            "{}",
+            render_matching_paths(hits.into_iter().map(|hit| hit.rel_path))
+        );
+        return Ok(());
+    }
     let hits = hits
         .into_iter()
         .map(|hit| {
@@ -656,6 +723,19 @@ fn render_search_hits(hits: &[RenderedSearchHit], style: SearchOutputStyle) -> S
         }
     }
 
+    if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    }
+}
+
+fn render_matching_paths(paths: impl IntoIterator<Item = String>) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let lines = paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect::<Vec<_>>();
     if lines.is_empty() {
         String::new()
     } else {
@@ -1118,6 +1198,8 @@ mod tests {
                     after_context: None,
                     before_context: None,
                     context: Some(2),
+                    ignore_case: false,
+                    files_with_matches: false,
                 },
                 query: Some("sqlite vector".to_string()),
                 path: Some(PathBuf::from("docs")),
@@ -1280,6 +1362,27 @@ mod tests {
                     after_context: Some(1),
                     before_context: Some(2),
                     context: None,
+                    ignore_case: false,
+                    files_with_matches: false,
+                },
+                pattern: "needle".to_string(),
+                path: Some(PathBuf::from("docs")),
+            })
+        );
+    }
+
+    #[test]
+    fn grep_subcommand_accepts_ignore_case_and_files_with_matches_flags() {
+        let cli = parse_cli_from(["zg", "grep", "-i", "-l", "needle", "docs"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Grep {
+                context: ContextArgs {
+                    after_context: None,
+                    before_context: None,
+                    context: None,
+                    ignore_case: true,
+                    files_with_matches: true,
                 },
                 pattern: "needle".to_string(),
                 path: Some(PathBuf::from("docs")),

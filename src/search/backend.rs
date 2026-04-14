@@ -27,6 +27,7 @@ pub trait ScanBackend {
         root: &Path,
         pattern: &str,
         context: SearchContext,
+        ignore_case: bool,
     ) -> ZgResult<Vec<GrepHit>>;
     fn literal_search(&self, root: &Path, pattern: &str) -> ZgResult<Vec<GrepHit>>;
 }

@@ -12,8 +12,13 @@ use crate::ZgResult;
 pub use backend::{GrepHit, ScanBackend, SearchContext};
 use ripgrep_backend::RipgrepScanBackend;
 
-pub fn regex_search(pattern: &str, root: &Path, context: SearchContext) -> ZgResult<Vec<GrepHit>> {
-    RipgrepScanBackend.regex_search(root, pattern, context)
+pub fn regex_search(
+    pattern: &str,
+    root: &Path,
+    context: SearchContext,
+    ignore_case: bool,
+) -> ZgResult<Vec<GrepHit>> {
+    RipgrepScanBackend.regex_search(root, pattern, context, ignore_case)
 }
 
 pub fn literal_search(pattern: &str, root: &Path) -> ZgResult<Vec<GrepHit>> {

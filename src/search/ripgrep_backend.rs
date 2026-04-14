@@ -21,6 +21,7 @@ impl ScanBackend for RipgrepScanBackend {
         root: &Path,
         pattern: &str,
         context: SearchContext,
+        ignore_case: bool,
     ) -> ZgResult<Vec<GrepHit>> {
         let root = paths::resolve_existing_path(root)?;
         if has_zg_component(&root) {
@@ -28,7 +29,7 @@ impl ScanBackend for RipgrepScanBackend {
         }
 
         let rg = resolve_rg_binary()?;
-        let mut hits = run_rg(&rg, pattern, &root, false, context)?;
+        let mut hits = run_rg(&rg, pattern, &root, false, context, ignore_case)?;
         hits.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -45,7 +46,7 @@ impl ScanBackend for RipgrepScanBackend {
         }
 
         let rg = resolve_rg_binary()?;
-        let mut hits = run_rg(&rg, pattern, &root, true, SearchContext::default())?;
+        let mut hits = run_rg(&rg, pattern, &root, true, SearchContext::default(), false)?;
         hits.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -114,6 +115,7 @@ fn run_rg(
     root: &Path,
     fixed_strings: bool,
     context: SearchContext,
+    ignore_case: bool,
 ) -> ZgResult<Vec<GrepHit>> {
     let mut command = Command::new(rg);
     command
@@ -132,6 +134,9 @@ fn run_rg(
         command
             .arg("--after-context")
             .arg(context.after.to_string());
+    }
+    if ignore_case {
+        command.arg("--ignore-case");
     }
     if fixed_strings {
         command.arg("--fixed-strings").arg("--ignore-case");
@@ -280,7 +285,7 @@ mod tests {
         fs::write(child.join("keep.md"), "needle visible").unwrap();
 
         let hits = RipgrepScanBackend
-            .regex_search(&child, "needle", SearchContext::default())
+            .regex_search(&child, "needle", SearchContext::default(), false)
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("keep.md"));
@@ -295,7 +300,7 @@ mod tests {
         fs::write(&file, "needle").unwrap();
 
         let hits = RipgrepScanBackend
-            .regex_search(&file, "needle", SearchContext::default())
+            .regex_search(&file, "needle", SearchContext::default(), false)
             .unwrap();
         assert!(hits.is_empty());
     }
@@ -307,7 +312,7 @@ mod tests {
         fs::write(root.join("a.md"), "needle first").unwrap();
 
         let hits = RipgrepScanBackend
-            .regex_search(&root, "needle", SearchContext::default())
+            .regex_search(&root, "needle", SearchContext::default(), false)
             .unwrap();
         let rendered = hits
             .iter()
@@ -338,7 +343,7 @@ mod tests {
         fs::write(&file, "alpha\nneedle one\nbeta\nneedle two").unwrap();
 
         let hits = RipgrepScanBackend
-            .regex_search(&file, "needle", SearchContext::default())
+            .regex_search(&file, "needle", SearchContext::default(), false)
             .unwrap();
         let lines = hits
             .iter()
