@@ -5,6 +5,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, params};
 
+use crate::search;
 use crate::{Query, ZgResult};
 
 use super::code_symbols::build_symbol_chunks;
@@ -12,8 +13,8 @@ use super::db::{ensure_index_root, load_index_level, open_existing_db, validate_
 use super::embed::embed_query;
 use super::files::build_chunks;
 use super::types::{
-    FTS_CANDIDATE_LIMIT, IndexLevel, RRF_K, ScopeKind, SearchHit, StoredChunk,
-    VECTOR_CANDIDATE_LIMIT,
+    FTS_CANDIDATE_LIMIT, IndexLevel, MAX_SEMANTIC_ONLY_HITS_WITH_LEXICAL,
+    MIN_VECTOR_SCORE_FOR_MERGE, RRF_K, ScopeKind, SearchHit, StoredChunk, VECTOR_CANDIDATE_LIMIT,
 };
 use super::util::scope_kind;
 
@@ -52,7 +53,8 @@ pub fn search_fts(
     }
 
     let lexical_rows = lexical_candidates(&conn, &root, &scope, &normalized)?;
-    let hits = merge_ranked_hits(lexical_rows, Vec::new());
+    let literal_rows = literal_candidates(&conn, &root, &scope, query.trim())?;
+    let hits = merge_ranked_hits(lexical_rows, literal_rows, Vec::new());
     let mut hits = materialize_live_snippets(&root, hits);
     hits.truncate(limit);
     Ok(hits)
@@ -77,9 +79,11 @@ pub fn search_hybrid(
 
     let query_vector = embed_query(normalized.normalized())?;
     let lexical_rows = lexical_candidates(&conn, &root, &scope, &normalized)?;
+    let literal_rows = literal_candidates(&conn, &root, &scope, query.trim())?;
     let vector_rows = vector_candidates(&conn, &root, &scope, &query_vector)?;
-    let hits = merge_ranked_hits(lexical_rows, vector_rows);
-    let mut hits = materialize_live_snippets(&root, hits);
+    let hits = merge_ranked_hits(lexical_rows, literal_rows, vector_rows);
+    let hits = materialize_live_snippets(&root, hits);
+    let mut hits = limit_semantic_only_hits(hits);
     hits.truncate(limit);
     Ok(hits)
 }
@@ -131,6 +135,10 @@ fn lexical_candidates(
                         language: row.get(6)?,
                         lexical_score: lexical_score(&normalized_text, query, bm25),
                         vector_score: 0.0,
+                        indexed_text_match: true,
+                        partial_text_match: false,
+                        literal_line_number: None,
+                        literal_preview: None,
                     })
                 },
             )?)
@@ -161,6 +169,10 @@ fn lexical_candidates(
                         language: row.get(6)?,
                         lexical_score: lexical_score(&normalized_text, query, bm25),
                         vector_score: 0.0,
+                        indexed_text_match: true,
+                        partial_text_match: false,
+                        literal_line_number: None,
+                        literal_preview: None,
                     })
                 },
             )?)
@@ -191,6 +203,10 @@ fn lexical_candidates(
                         language: row.get(6)?,
                         lexical_score: lexical_score(&normalized_text, query, bm25),
                         vector_score: 0.0,
+                        indexed_text_match: true,
+                        partial_text_match: false,
+                        literal_line_number: None,
+                        literal_preview: None,
                     })
                 },
             )?)
@@ -305,21 +321,55 @@ fn vector_candidates(
 
     Ok(rows
         .into_iter()
-        .filter(|row| row.vector_score > 0.0)
+        .filter(|row| vector_score_is_mergeable(row.vector_score))
         .collect())
 }
 
 fn merge_ranked_hits(
     lexical_rows: Vec<StoredChunk>,
+    literal_rows: Vec<StoredChunk>,
     vector_rows: Vec<StoredChunk>,
 ) -> Vec<SearchHit> {
     let mut by_chunk = HashMap::<i64, StoredChunk>::new();
     let mut lexical_rank = HashMap::<i64, usize>::new();
+    let mut literal_rank = HashMap::<i64, usize>::new();
     let mut vector_rank = HashMap::<i64, usize>::new();
 
     for (rank, row) in lexical_rows.into_iter().enumerate() {
         lexical_rank.insert(row.chunk_id, rank);
-        by_chunk.insert(row.chunk_id, row);
+        by_chunk
+            .entry(row.chunk_id)
+            .and_modify(|existing| {
+                existing.lexical_score = existing.lexical_score.max(row.lexical_score);
+                existing.indexed_text_match |= row.indexed_text_match;
+                existing.partial_text_match |= row.partial_text_match;
+                if existing.literal_line_number.is_none() {
+                    existing.literal_line_number = row.literal_line_number;
+                }
+                if existing.literal_preview.is_none() {
+                    existing.literal_preview = row.literal_preview.clone();
+                }
+            })
+            .or_insert(row);
+    }
+    for (rank, row) in literal_rows.into_iter().enumerate() {
+        literal_rank.insert(row.chunk_id, rank);
+        by_chunk
+            .entry(row.chunk_id)
+            .and_modify(|existing| {
+                existing.lexical_score = existing.lexical_score.max(row.lexical_score);
+                existing.indexed_text_match |= row.indexed_text_match;
+                existing.partial_text_match |= row.partial_text_match;
+                existing.literal_line_number =
+                    row.literal_line_number.or(existing.literal_line_number);
+                if row.literal_preview.is_some() {
+                    existing.literal_preview = row.literal_preview.clone();
+                }
+                if existing.rel_path.is_empty() {
+                    existing.rel_path = row.rel_path.clone();
+                }
+            })
+            .or_insert(row);
     }
     for (rank, row) in vector_rows.into_iter().enumerate() {
         vector_rank.insert(row.chunk_id, rank);
@@ -327,6 +377,14 @@ fn merge_ranked_hits(
             .entry(row.chunk_id)
             .and_modify(|existing| {
                 existing.vector_score = row.vector_score;
+                existing.indexed_text_match |= row.indexed_text_match;
+                existing.partial_text_match |= row.partial_text_match;
+                if existing.literal_line_number.is_none() {
+                    existing.literal_line_number = row.literal_line_number;
+                }
+                if existing.literal_preview.is_none() {
+                    existing.literal_preview = row.literal_preview.clone();
+                }
                 if existing.rel_path.is_empty() {
                     existing.rel_path = row.rel_path.clone();
                 }
@@ -342,6 +400,10 @@ fn merge_ranked_hits(
                 .get(&row.chunk_id)
                 .map(|rank| 1.0 / (RRF_K + *rank as f64))
                 .unwrap_or(0.0);
+            let literal_rrf = literal_rank
+                .get(&row.chunk_id)
+                .map(|rank| 1.0 / (RRF_K + *rank as f64))
+                .unwrap_or(0.0);
             let vector_rrf = vector_rank
                 .get(&row.chunk_id)
                 .map(|rank| 1.0 / (RRF_K + *rank as f64))
@@ -351,9 +413,13 @@ fn merge_ranked_hits(
                 snippet: String::new(),
                 line_start: row.line_start,
                 line_end: row.line_end,
-                score: lexical_rrf + vector_rrf,
+                score: lexical_rrf + literal_rrf + vector_rrf,
                 lexical_score: row.lexical_score,
                 vector_score: row.vector_score,
+                indexed_text_match: row.indexed_text_match,
+                partial_text_match: row.partial_text_match,
+                literal_line_number: row.literal_line_number,
+                literal_preview: row.literal_preview,
                 chunk_index: row.chunk_index,
                 chunk_kind: row.chunk_kind,
                 language: row.language,
@@ -362,10 +428,14 @@ fn merge_ranked_hits(
         .collect::<Vec<_>>();
 
     hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
+        source_priority(right)
+            .cmp(&source_priority(left))
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+            })
             .then_with(|| {
                 right
                     .lexical_score
@@ -377,6 +447,88 @@ fn merge_ranked_hits(
     hits
 }
 
+fn source_priority(hit: &SearchHit) -> (u8, u8, u8, u8) {
+    let semantic_match = u8::from(hit.vector_score > 0.0);
+    let indexed_text_match = u8::from(hit.indexed_text_match);
+    let partial_text_match = u8::from(hit.partial_text_match);
+    let source_count = partial_text_match + indexed_text_match + semantic_match;
+    (
+        partial_text_match,
+        source_count,
+        indexed_text_match,
+        semantic_match,
+    )
+}
+
+fn literal_candidates(
+    conn: &Connection,
+    root: &Path,
+    scope: &Path,
+    query: &str,
+) -> ZgResult<Vec<StoredChunk>> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT cr.id, f.rel_path, cr.chunk_index, cr.line_start, cr.line_end, cr.chunk_kind, cr.language
+         FROM chunk_refs cr
+         JOIN files f ON f.id = cr.file_id
+         WHERE f.rel_path = ?1
+           AND cr.line_start <= ?2
+           AND cr.line_end >= ?2
+         ORDER BY (cr.line_end - cr.line_start) ASC, cr.chunk_index ASC
+         LIMIT 1",
+    )?;
+
+    let mut by_chunk = HashMap::<i64, (usize, StoredChunk)>::new();
+    for (rank, hit) in search::literal_search(query, scope)?
+        .into_iter()
+        .enumerate()
+    {
+        let Some(rel_path) = rg_hit_rel_path(root, &hit.path) else {
+            continue;
+        };
+        let Ok(row) = stmt.query_row(params![rel_path, hit.line_number as i64], |row| {
+            Ok(StoredChunk {
+                chunk_id: row.get(0)?,
+                rel_path: row.get(1)?,
+                chunk_index: row.get::<_, i64>(2)? as usize,
+                line_start: row.get::<_, i64>(3)? as usize,
+                line_end: row.get::<_, i64>(4)? as usize,
+                chunk_kind: row.get(5)?,
+                language: row.get(6)?,
+                lexical_score: 1.0,
+                vector_score: 0.0,
+                indexed_text_match: false,
+                partial_text_match: true,
+                literal_line_number: Some(hit.line_number),
+                literal_preview: Some(hit.line.clone()),
+            })
+        }) else {
+            continue;
+        };
+        by_chunk
+            .entry(row.chunk_id)
+            .and_modify(|existing| {
+                if rank < existing.0 {
+                    *existing = (rank, row.clone());
+                }
+            })
+            .or_insert((rank, row));
+    }
+
+    let mut rows = by_chunk.into_values().collect::<Vec<_>>();
+    rows.sort_by_key(|(rank, _)| *rank);
+    Ok(rows.into_iter().map(|(_, row)| row).collect())
+}
+
+fn rg_hit_rel_path(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+}
+
 fn materialize_live_snippets(root: &Path, mut hits: Vec<SearchHit>) -> Vec<SearchHit> {
     let mut by_path = HashMap::<String, Vec<usize>>::new();
     for (idx, hit) in hits.iter().enumerate() {
@@ -386,17 +538,29 @@ fn materialize_live_snippets(root: &Path, mut hits: Vec<SearchHit>) -> Vec<Searc
 
     for (rel_path, hit_indexes) in by_path {
         let file_path = root.join(&rel_path);
-        let Ok(bytes) = fs::read(&file_path) else {
-            continue;
-        };
-        let Ok(body) = String::from_utf8(bytes) else {
-            continue;
-        };
+        let body = fs::read(&file_path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+
         for hit_idx in hit_indexes {
+            if let (Some(line_number), Some(preview)) = (
+                hits[hit_idx].literal_line_number,
+                hits[hit_idx].literal_preview.clone(),
+            ) {
+                hits[hit_idx].snippet = preview;
+                hits[hit_idx].line_start = line_number;
+                hits[hit_idx].line_end = line_number;
+                keep[hit_idx] = true;
+                continue;
+            }
+
+            let Some(body) = body.as_ref() else {
+                continue;
+            };
             let chunks = if hits[hit_idx].chunk_kind == "symbol" {
-                build_symbol_chunks(&file_path, &body)
+                build_symbol_chunks(&file_path, body)
             } else {
-                let Ok(chunks) = build_chunks(&body) else {
+                let Ok(chunks) = build_chunks(body) else {
                     continue;
                 };
                 chunks
@@ -414,6 +578,30 @@ fn materialize_live_snippets(root: &Path, mut hits: Vec<SearchHit>) -> Vec<Searc
     hits.into_iter()
         .enumerate()
         .filter_map(|(idx, hit)| keep[idx].then_some(hit))
+        .collect()
+}
+
+fn limit_semantic_only_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    if !hits.iter().any(|hit| hit.lexical_score > 0.0) {
+        return hits;
+    }
+
+    let mut semantic_only_kept = 0usize;
+    hits.into_iter()
+        .filter(|hit| {
+            if hit.lexical_score > 0.0 {
+                return true;
+            }
+            if hit.vector_score <= 0.0 {
+                return false;
+            }
+            if semantic_only_kept < MAX_SEMANTIC_ONLY_HITS_WITH_LEXICAL {
+                semantic_only_kept += 1;
+                true
+            } else {
+                false
+            }
+        })
         .collect()
 }
 
@@ -447,6 +635,10 @@ fn collect_vector_rows(
     Ok(out)
 }
 
+fn vector_score_is_mergeable(vector_score: f64) -> bool {
+    vector_score >= MIN_VECTOR_SCORE_FOR_MERGE
+}
+
 fn vector_row_from_distance(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredChunk> {
     let distance: f64 = row.get(7)?;
     Ok(StoredChunk {
@@ -459,6 +651,10 @@ fn vector_row_from_distance(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredC
         language: row.get(6)?,
         lexical_score: 0.0,
         vector_score: 1.0 - distance,
+        indexed_text_match: false,
+        partial_text_match: false,
+        literal_line_number: None,
+        literal_preview: None,
     })
 }
 
@@ -481,7 +677,11 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{SearchHit, StoredChunk, materialize_live_snippets, merge_ranked_hits};
+    use super::{
+        MAX_SEMANTIC_ONLY_HITS_WITH_LEXICAL, MIN_VECTOR_SCORE_FOR_MERGE, SearchHit, StoredChunk,
+        limit_semantic_only_hits, materialize_live_snippets, merge_ranked_hits,
+        vector_score_is_mergeable,
+    };
     use crate::index::{init_index, search_hybrid};
 
     struct Row<'a> {
@@ -505,6 +705,10 @@ mod tests {
             language: None,
             lexical_score: input.lexical,
             vector_score: input.vector,
+            indexed_text_match: input.lexical > 0.0,
+            partial_text_match: false,
+            literal_line_number: None,
+            literal_preview: None,
         }
     }
 
@@ -530,6 +734,7 @@ mod tests {
                 lexical: 2.0,
                 vector: 0.0,
             })],
+            Vec::new(),
             vec![row(Row {
                 chunk_id: 2,
                 rel_path: "beta.md",
@@ -575,6 +780,7 @@ mod tests {
                     vector: 0.0,
                 }),
             ],
+            Vec::new(),
             vec![
                 row(Row {
                     chunk_id: 1,
@@ -609,6 +815,298 @@ mod tests {
     }
 
     #[test]
+    fn partial_hits_sort_ahead_of_non_partial_hits() {
+        let hits = merge_ranked_hits(
+            vec![row(Row {
+                chunk_id: 1,
+                rel_path: "alpha.md",
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                lexical: 1.8,
+                vector: 0.0,
+            })],
+            vec![StoredChunk {
+                chunk_id: 2,
+                rel_path: "beta.md".to_string(),
+                chunk_index: 0,
+                line_start: 3,
+                line_end: 3,
+                chunk_kind: "text".to_string(),
+                language: None,
+                lexical_score: 1.0,
+                vector_score: 0.0,
+                indexed_text_match: false,
+                partial_text_match: true,
+                literal_line_number: Some(3),
+                literal_preview: Some("beta literal".to_string()),
+            }],
+            vec![row(Row {
+                chunk_id: 3,
+                rel_path: "gamma.md",
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                lexical: 0.0,
+                vector: 0.9,
+            })],
+        );
+
+        assert_eq!(hits[0].rel_path, "beta.md");
+        assert_eq!(hits[1].rel_path, "alpha.md");
+        assert_eq!(hits[2].rel_path, "gamma.md");
+    }
+
+    #[test]
+    fn weak_vector_scores_are_filtered_before_rank_fusion() {
+        let lexical_rows = vec![row(Row {
+            chunk_id: 1,
+            rel_path: "alpha.md",
+            chunk_index: 0,
+            line_start: 1,
+            line_end: 1,
+            lexical: 1.3,
+            vector: 0.0,
+        })];
+        let vector_rows = vec![
+            row(Row {
+                chunk_id: 1,
+                rel_path: "alpha.md",
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                lexical: 0.0,
+                vector: 0.05,
+            }),
+            row(Row {
+                chunk_id: 2,
+                rel_path: "beta.md",
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                lexical: 0.0,
+                vector: 0.19,
+            }),
+            row(Row {
+                chunk_id: 3,
+                rel_path: "gamma.md",
+                chunk_index: 0,
+                line_start: 1,
+                line_end: 1,
+                lexical: 0.0,
+                vector: 0.35,
+            }),
+        ]
+        .into_iter()
+        .filter(|row| vector_score_is_mergeable(row.vector_score))
+        .collect::<Vec<_>>();
+
+        let hits = merge_ranked_hits(lexical_rows, Vec::new(), vector_rows);
+
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| hit.rel_path == "alpha.md"
+            && hit.lexical_score > 0.0
+            && hit.vector_score == 0.0));
+        assert!(!hits.iter().any(|hit| hit.rel_path == "beta.md"));
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rel_path == "gamma.md" && hit.vector_score > 0.0)
+        );
+    }
+
+    #[test]
+    fn vector_merge_floor_keeps_meaningful_semantic_matches() {
+        assert!(!vector_score_is_mergeable(
+            MIN_VECTOR_SCORE_FOR_MERGE - 0.01
+        ));
+        assert!(vector_score_is_mergeable(MIN_VECTOR_SCORE_FOR_MERGE));
+        assert!(vector_score_is_mergeable(0.42));
+    }
+
+    #[test]
+    fn semantic_only_hits_are_capped_when_lexical_hits_exist() {
+        let hits = limit_semantic_only_hits(vec![
+            SearchHit {
+                rel_path: "alpha.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.20,
+                lexical_score: 1.0,
+                vector_score: 0.4,
+                indexed_text_match: true,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "beta.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.19,
+                lexical_score: 0.0,
+                vector_score: 0.6,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "gamma.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.18,
+                lexical_score: 0.0,
+                vector_score: 0.5,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "delta.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.17,
+                lexical_score: 0.0,
+                vector_score: 0.4,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "epsilon.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.16,
+                lexical_score: 0.0,
+                vector_score: 0.3,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "zeta.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.15,
+                lexical_score: 0.0,
+                vector_score: 0.29,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "eta.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.14,
+                lexical_score: 0.0,
+                vector_score: 0.28,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+        ]);
+
+        assert_eq!(hits.len(), 1 + MAX_SEMANTIC_ONLY_HITS_WITH_LEXICAL);
+        assert!(hits.iter().any(|hit| hit.rel_path == "alpha.md"));
+        assert!(hits.iter().any(|hit| hit.rel_path == "beta.md"));
+        assert!(hits.iter().any(|hit| hit.rel_path == "gamma.md"));
+        assert!(hits.iter().any(|hit| hit.rel_path == "delta.md"));
+        assert!(hits.iter().any(|hit| hit.rel_path == "epsilon.md"));
+        assert!(hits.iter().any(|hit| hit.rel_path == "zeta.md"));
+        assert!(!hits.iter().any(|hit| hit.rel_path == "eta.md"));
+    }
+
+    #[test]
+    fn semantic_only_hits_are_not_capped_without_lexical_hits() {
+        let hits = limit_semantic_only_hits(vec![
+            SearchHit {
+                rel_path: "beta.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.19,
+                lexical_score: 0.0,
+                vector_score: 0.6,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "gamma.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.18,
+                lexical_score: 0.0,
+                vector_score: 0.5,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+            SearchHit {
+                rel_path: "delta.md".to_string(),
+                snippet: String::new(),
+                line_start: 1,
+                line_end: 1,
+                score: 0.17,
+                lexical_score: 0.0,
+                vector_score: 0.4,
+                indexed_text_match: false,
+                partial_text_match: false,
+                literal_line_number: None,
+                literal_preview: None,
+                chunk_index: 0,
+                chunk_kind: "text".to_string(),
+                language: None,
+            },
+        ]);
+
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
     fn live_materialization_prefers_current_file_contents_over_stale_index_metadata() {
         let root = temp_dir("materialize-live");
         let file = root.join("alpha.md");
@@ -628,6 +1126,36 @@ mod tests {
     }
 
     #[test]
+    fn materialize_live_snippets_prefers_literal_preview_for_partial_hits() {
+        let root = temp_dir("materialize-literal");
+        let file = root.join("alpha.md");
+        fs::write(&file, "prefix line\nneedle exact line\nsuffix line\n").unwrap();
+
+        let hits = vec![SearchHit {
+            rel_path: "alpha.md".to_string(),
+            snippet: String::new(),
+            line_start: 999,
+            line_end: 999,
+            score: 1.0,
+            lexical_score: 1.0,
+            vector_score: 0.0,
+            indexed_text_match: false,
+            partial_text_match: true,
+            literal_line_number: Some(2),
+            literal_preview: Some("needle exact line".to_string()),
+            chunk_index: 0,
+            chunk_kind: "text".to_string(),
+            language: None,
+        }];
+
+        let hits = materialize_live_snippets(&root, hits);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line_start, 2);
+        assert_eq!(hits[0].line_end, 2);
+        assert_eq!(hits[0].snippet, "needle exact line");
+    }
+
+    #[test]
     fn materialize_live_snippets_drops_unreadable_results() {
         let root = temp_dir("materialize-fallback");
         let hits = vec![SearchHit {
@@ -638,6 +1166,10 @@ mod tests {
             score: 1.0,
             lexical_score: 1.0,
             vector_score: 0.0,
+            indexed_text_match: true,
+            partial_text_match: false,
+            literal_line_number: None,
+            literal_preview: None,
             chunk_index: 0,
             chunk_kind: "text".to_string(),
             language: None,

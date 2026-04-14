@@ -214,11 +214,7 @@ pub fn run_sample_vault_benchmark(
                     .unwrap_or_else(|| scratch_vault.clone());
                 let command = run_timed_command(
                     exe_path,
-                    &[
-                        "search",
-                        &case.query,
-                        &scope.display().to_string(),
-                    ],
+                    &["search", &case.query, &scope.display().to_string()],
                     fake_embeddings,
                 )?;
                 query_times.push(command.elapsed_ms);
@@ -312,7 +308,10 @@ fn copy_tree_excluding(src: &Path, dst: &Path, excluded_names: &[&str]) -> io::R
         let entry = entry?;
         let src_path = entry.path();
         let file_name = entry.file_name();
-        if excluded_names.iter().any(|name| file_name == OsStr::new(name)) {
+        if excluded_names
+            .iter()
+            .any(|name| file_name == OsStr::new(name))
+        {
             continue;
         }
 
@@ -334,7 +333,11 @@ struct TimedCommand {
     stdout_lines: usize,
 }
 
-fn run_timed_command(exe_path: &Path, args: &[&str], fake_embeddings: bool) -> ZgResult<TimedCommand> {
+fn run_timed_command(
+    exe_path: &Path,
+    args: &[&str],
+    fake_embeddings: bool,
+) -> ZgResult<TimedCommand> {
     let started = Instant::now();
     let mut command = Command::new(exe_path);
     command.args(args);

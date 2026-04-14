@@ -16,6 +16,10 @@ pub fn regex_search(pattern: &str, root: &Path) -> ZgResult<Vec<GrepHit>> {
     RipgrepScanBackend.regex_search(root, pattern)
 }
 
+pub fn literal_search(pattern: &str, root: &Path) -> ZgResult<Vec<GrepHit>> {
+    RipgrepScanBackend.literal_search(root, pattern)
+}
+
 pub fn is_probably_regex(input: &str) -> bool {
     if !contains_regex_signal(input) {
         return false;

@@ -1,0 +1,19 @@
+{
+  "schema_version": 10,
+  "index_root": "/Users/jun/git/zettagrep",
+  "indexed": true,
+  "index_level": "fts+vector",
+  "chunk_mode": "line+short-merge",
+  "chunk_marker": " :: ",
+  "scope_policy": "document suffix + supported code language whitelist + encoding/character whitelist",
+  "walk_policy": "ripgrep-style: parent ignore + hidden + .ignore/.gitignore/git excludes + .zgignore; .zg/ always skipped",
+  "dirty": false,
+  "dirty_reason": null,
+  "last_sync_unix_ms": 1776136649302,
+  "file_count": 30,
+  "chunk_count": 804,
+  "fts_ready": true,
+  "vector_ready": true,
+  "last_index_run_status": "completed",
+  "last_index_run_duration_ms": 22407
+}

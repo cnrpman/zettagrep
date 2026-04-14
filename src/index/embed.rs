@@ -13,7 +13,7 @@ use std::thread::ThreadId;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use super::types::VECTOR_DIMENSIONS;
-use crate::{other, ZgResult};
+use crate::{ZgResult, other};
 
 #[cfg(not(test))]
 static TEXT_EMBEDDER: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
@@ -247,8 +247,9 @@ fn embed_capture_thread() -> &'static Mutex<Option<ThreadId>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        configured_fastembed_batch_size, test_begin_embed_capture_for_current_thread,
-        test_embed_counters, test_reset_embed_counters, DEFAULT_FASTEMBED_BATCH_SIZE,
+        DEFAULT_FASTEMBED_BATCH_SIZE, configured_fastembed_batch_size,
+        test_begin_embed_capture_for_current_thread, test_embed_counters,
+        test_reset_embed_counters,
     };
 
     #[test]

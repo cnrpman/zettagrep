@@ -43,7 +43,10 @@ pub fn explicit_index_required_error(
     suggest_fts: bool,
     suggest_vector: bool,
 ) -> String {
-    let mut lines = vec![format!("zg: no ancestor .zg index found for {}", root.display())];
+    let mut lines = vec![format!(
+        "zg: no ancestor .zg index found for {}",
+        root.display()
+    )];
     lines.push(format!("    estimated chunks: {}", estimated_chunks));
 
     if suggest_fts {
@@ -68,17 +71,26 @@ pub fn explicit_index_required_error(
     lines.join("\n")
 }
 
-pub fn index_level_follow_up(root: &Path, index_level: IndexLevel, chunk_count: usize) -> Option<String> {
+pub fn index_level_follow_up(
+    root: &Path,
+    index_level: IndexLevel,
+    chunk_count: usize,
+) -> Option<String> {
     match index_level {
         IndexLevel::Fts if chunk_count <= VECTOR_PROMPT_MAX_CHUNKS => Some(format!(
             "next: `zg index rebuild --level fts+vector \"{}\"` enables semantic recall for natural-language queries",
             root.display()
         )),
         IndexLevel::Fts => None,
-        IndexLevel::FtsVector => Some(
-            "note: `fts+vector` supports semantic recall, but initial build and some queries may be slower than `fts`".to_string(),
-        ),
+        IndexLevel::FtsVector => None,
     }
+}
+
+pub fn vector_index_start_notice(root: &Path, operation: &str) -> String {
+    format!(
+        "note: starting `fts+vector` index {operation} for {}; this may take a while, especially on the first run while embeddings are prepared",
+        root.display(),
+    )
 }
 
 pub fn status_level_hint(root: &Path, index_level: IndexLevel, chunk_count: u64) -> Option<String> {

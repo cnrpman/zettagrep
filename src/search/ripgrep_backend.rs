@@ -23,7 +23,24 @@ impl ScanBackend for RipgrepScanBackend {
         }
 
         let rg = resolve_rg_binary()?;
-        let mut hits = run_rg(&rg, pattern, &root)?;
+        let mut hits = run_rg(&rg, pattern, &root, false)?;
+        hits.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.line_number.cmp(&right.line_number))
+                .then_with(|| left.line.cmp(&right.line))
+        });
+        Ok(hits)
+    }
+
+    fn literal_search(&self, root: &Path, pattern: &str) -> ZgResult<Vec<GrepHit>> {
+        let root = paths::resolve_existing_path(root)?;
+        if has_zg_component(&root) {
+            return Ok(Vec::new());
+        }
+
+        let rg = resolve_rg_binary()?;
+        let mut hits = run_rg(&rg, pattern, &root, true)?;
         hits.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -86,14 +103,19 @@ fn has_zg_component(path: &Path) -> bool {
         .any(|component| matches!(component, Component::Normal(name) if name == ".zg"))
 }
 
-fn run_rg(rg: &OsStr, pattern: &str, root: &Path) -> ZgResult<Vec<GrepHit>> {
-    let output = Command::new(rg)
+fn run_rg(rg: &OsStr, pattern: &str, root: &Path, fixed_strings: bool) -> ZgResult<Vec<GrepHit>> {
+    let mut command = Command::new(rg);
+    command
         .arg("--json")
         .arg("--line-number")
         .arg("--color")
         .arg("never")
         .arg("--glob")
-        .arg("!.zg/**")
+        .arg("!.zg/**");
+    if fixed_strings {
+        command.arg("--fixed-strings").arg("--ignore-case");
+    }
+    let output = command
         .arg("-e")
         .arg(pattern)
         .arg("--")
@@ -296,6 +318,38 @@ mod tests {
 
         assert_eq!(lines, vec![(2, "needle one"), (4, "needle two")]);
         assert!(hits.iter().all(|hit| hit.path == file));
+    }
+
+    #[test]
+    fn literal_search_treats_metacharacters_verbatim() {
+        let root = temp_dir("literal-metacharacters");
+        let file = root.join("note.md");
+        fs::write(&file, "see docs/r0_product_philosophy.md for source").unwrap();
+
+        let hits = RipgrepScanBackend
+            .literal_search(&root, "docs/r0_product_philosophy.md")
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, file);
+        assert_eq!(hits[0].line_number, 1);
+        assert_eq!(hits[0].line, "see docs/r0_product_philosophy.md for source");
+    }
+
+    #[test]
+    fn literal_search_is_case_insensitive_for_plain_query_semantics() {
+        let root = temp_dir("literal-ignore-case");
+        let file = root.join("note.md");
+        fs::write(&file, "see Docs/R0_Product_Philosophy.md for source").unwrap();
+
+        let hits = RipgrepScanBackend
+            .literal_search(&root, "docs/r0_product_philosophy.md")
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, file);
+        assert_eq!(hits[0].line_number, 1);
+        assert_eq!(hits[0].line, "see Docs/R0_Product_Philosophy.md for source");
     }
 
     #[test]

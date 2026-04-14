@@ -12,8 +12,8 @@ use super::db::{
     create_schema, delete_by_rel_path, ensure_index_root, gc_unreferenced_shared_chunks,
     load_file_rows_for_scope, load_index_level, load_state, load_state_mirror_status, mark_dirty,
     open_existing_db, open_or_create_db, prepare_missing_shared_chunk_vectors, reset_schema,
-    seed_defaults, set_dirty_state, set_index_level, status_for_index_root, upsert_document, validate_schema,
-    with_write_transaction_retry, write_state_mirror,
+    seed_defaults, set_dirty_state, set_index_level, status_for_index_root, upsert_document,
+    validate_schema, with_write_transaction_retry, write_state_mirror,
 };
 use super::files::{
     collect_candidate_files, collect_scope_candidates, estimate_indexable_chunks,

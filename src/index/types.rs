@@ -21,6 +21,11 @@ pub const VECTOR_PROMPT_MAX_CHUNKS: usize = 1_024;
 pub(crate) const VECTOR_DIMENSIONS: usize = 384;
 pub(crate) const FTS_CANDIDATE_LIMIT: usize = 96;
 pub(crate) const VECTOR_CANDIDATE_LIMIT: usize = 96;
+// Weak near-zero semantic similarity adds noisy recall once rank fusion starts
+// rewarding candidate position. Keep the floor conservative so lexical matches
+// still dominate while clearly relevant semantic-only hits remain visible.
+pub(crate) const MIN_VECTOR_SCORE_FOR_MERGE: f64 = 0.20;
+pub(crate) const MAX_SEMANTIC_ONLY_HITS_WITH_LEXICAL: usize = 5;
 pub(crate) const RRF_K: f64 = 20.0;
 
 pub(crate) const ALLOWED_EXTENSIONS: &[&str] = &[
@@ -83,6 +88,10 @@ pub struct SearchHit {
     pub score: f64,
     pub lexical_score: f64,
     pub vector_score: f64,
+    pub indexed_text_match: bool,
+    pub partial_text_match: bool,
+    pub literal_line_number: Option<usize>,
+    pub literal_preview: Option<String>,
     pub(crate) chunk_index: usize,
     pub(crate) chunk_kind: String,
     pub(crate) language: Option<String>,
@@ -164,6 +173,10 @@ pub(crate) struct StoredChunk {
     pub(crate) language: Option<String>,
     pub(crate) lexical_score: f64,
     pub(crate) vector_score: f64,
+    pub(crate) indexed_text_match: bool,
+    pub(crate) partial_text_match: bool,
+    pub(crate) literal_line_number: Option<usize>,
+    pub(crate) literal_preview: Option<String>,
 }
 
 #[derive(Serialize)]

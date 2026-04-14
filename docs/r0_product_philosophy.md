@@ -20,9 +20,14 @@
 - regex 是地面真相;像 regex 的输入永远按 regex 语义执行。
 - 非 regex 搜索要求祖先链上已经存在显式建立的 `.zg`;如果不存在,系统应直接返回可执行的错误,提示用户先运行 `zg index init`。
 - indexed search 只有两个 level:`fts` 与 `fts+vector`。
-- `fts` 是 lexical-only 路径,用于低延迟、低成本的默认索引。
-- `fts+vector` 是 hybrid recall:lexical 与 embedding 信号并列参与召回,lexical 召回不得被向量分数淹没或隐藏,向量也不是可有可无的 rerank 附件。具体融合方式属于内部实现,可以演进,但这条语义承诺不能退化。
+- 非 regex 搜索的 text channel 不只来自数据库 lexical index;它还应并入 ripgrep fixed-string literal recall,保证用户已经习惯的字面命中在 indexed search 里仍然可见。
+- non-regex plain query 的 `r` 通道应继承 plain query 的大小写语义:默认大小写不敏感,不能因为底层用了 ripgrep literal recall 就突然退化成大小写敏感。
+- regex 仍然是独立路径;plain query 结果里不混入 regex recall,只有 index text / partial literal / semantic 三类来源。
+- `fts` 是 text-only 路径,用于低延迟、低成本的默认索引;这里的 text 指 indexed lexical recall 与 ripgrep literal recall 的并集。
+- `fts+vector` 是 hybrid recall:text 与 embedding 信号并列参与召回,text 召回不得被向量分数淹没或隐藏,向量也不是可有可无的 rerank 附件。具体融合方式属于内部实现,可以演进,但这条语义承诺不能退化。
+- 展示层应区分 `f`(来自 index lexical / FTS)、`r`(来自 ripgrep fixed-string literal recall)、`v`(来自向量召回);如果一个结果同时吃到多个来源,标签应明确表达组合关系,例如 `[rfv]`,不能把不同来源混成一个模糊标签。
 - level 是显式索引决策的一部分,而不是搜索时偷偷升级的内部细节。用户建什么 level,搜索就走什么 level。
+- 当结果里已经存在 `text` 或 `text+semantic` 命中时,`semantic-only` 结果只是尾部补充,当前固定最多显示 5 条;如果完全没有 text 命中,则允许 semantic 结果填满结果页。
 
 ## 新鲜度模型
 

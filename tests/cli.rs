@@ -54,11 +54,40 @@ fn help_prints_dual_entry_usage() {
     assert!(output.stderr.is_empty());
 
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Local-first search CLI for note-heavy directories."));
     assert!(stdout.contains("Usage: zg <QUERY> [PATH]"));
     assert!(stdout.contains("zg <COMMAND>"));
-    assert!(stdout.contains("grep"));
-    assert!(stdout.contains("search"));
-    assert!(stdout.contains("index"));
+    assert!(stdout.contains("Regex-shaped input uses grep semantics immediately."));
+    assert!(stdout.contains("grep    Run regex search immediately with ripgrep semantics"));
+    assert!(
+        stdout.contains(
+            "search  Run indexed plain-text search inside the nearest ancestor `.zg/` root"
+        )
+    );
+    assert!(stdout.contains("index   Manage the local `.zg/` search index"));
+    assert!(stdout.contains("Examples:"));
+    assert!(stdout.contains("zg index init notes/"));
+}
+
+#[test]
+fn subcommand_help_prints_explanatory_text() {
+    let grep_output = zg().args(["grep", "--help"]).output().unwrap();
+    assert!(grep_output.status.success());
+    assert!(grep_output.stderr.is_empty());
+    let grep_stdout = String::from_utf8(grep_output.stdout).unwrap();
+    assert!(grep_stdout.contains("Run regex search immediately with ripgrep semantics"));
+    assert!(grep_stdout.contains("Regex pattern passed through to ripgrep"));
+
+    let init_output = zg().args(["index", "init", "--help"]).output().unwrap();
+    assert!(init_output.status.success());
+    assert!(init_output.stderr.is_empty());
+    let init_stdout = String::from_utf8(init_output.stdout).unwrap();
+    assert!(init_stdout.contains("Create a local `.zg/` index for a directory"));
+    assert!(
+        init_stdout.contains(
+            "Index level to build: `fts` for lexical only, `fts+vector` for hybrid recall"
+        )
+    );
 }
 
 #[test]
@@ -177,7 +206,7 @@ fn schema_mismatch_search_failure_tells_user_to_rebuild() {
 }
 
 #[test]
-fn indexed_search_prints_stable_result_line_shape() {
+fn indexed_search_prints_plain_rg_like_result_lines() {
     let root = temp_dir("indexed-output");
     fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
 
@@ -196,10 +225,54 @@ fn indexed_search_prints_stable_result_line_shape() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1);
-    assert!(lines[0].starts_with("alpha.md  score="));
-    assert!(lines[0].contains("  lexical="));
-    assert!(lines[0].contains("  vector="));
-    assert!(lines[0].ends_with("sqlite vector adapter"));
+    assert_eq!(lines[0], "alpha.md:[f] 1: sqlite vector adapter");
+}
+
+#[test]
+fn indexed_search_uses_ripgrep_literal_recall_for_marker_queries() {
+    let root = temp_dir("indexed-literal-recall");
+    fs::write(root.join("alpha.md"), "alpha :: beta\n").unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let output = zg().args(["search", "::"]).arg(&root).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines, vec!["alpha.md:[r] 1: alpha :: beta"]);
+}
+
+#[test]
+fn indexed_search_uses_case_insensitive_ripgrep_literal_recall() {
+    let root = temp_dir("indexed-literal-ignore-case");
+    fs::write(
+        root.join("alpha.md"),
+        "see Docs/R0_Product_Philosophy.md for source\n",
+    )
+    .unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let output = zg()
+        .args(["search", "docs/r0_product_philosophy.md"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec!["alpha.md:[rf] 1: see Docs/R0_Product_Philosophy.md for source"]
+    );
 }
 
 #[test]
@@ -216,6 +289,53 @@ fn index_init_defaults_to_fts_level() {
     let stdout = String::from_utf8(status.stdout).unwrap();
     assert!(stdout.contains("index level: fts"));
     assert!(stdout.contains("vector ready: no"));
+}
+
+#[test]
+fn vector_index_init_prints_wait_note_to_stderr() {
+    let root = temp_dir("vector-init-note");
+    fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+
+    let output = zg()
+        .args(["index", "init", "--level", "fts+vector"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("starting `fts+vector` index init"));
+    assert!(stderr.contains("may take a while"));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("initialized"));
+    assert!(stdout.contains("level=fts+vector"));
+}
+
+#[test]
+fn vector_index_rebuild_prints_wait_note_to_stderr() {
+    let root = temp_dir("vector-rebuild-note");
+    fs::write(root.join("alpha.md"), "sqlite vector adapter\n").unwrap();
+
+    let init = zg().args(["index", "init"]).arg(&root).output().unwrap();
+    assert!(init.status.success());
+
+    let output = zg()
+        .args(["index", "rebuild", "--level", "fts+vector"])
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("starting `fts+vector` index rebuild"));
+    assert!(stderr.contains("may take a while"));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("rebuilt"));
+    assert!(stdout.contains("level=fts+vector"));
 }
 
 #[test]
@@ -368,8 +488,7 @@ fn indexed_search_stays_available_while_another_writer_holds_the_db_lock() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1);
-    assert!(lines[0].starts_with("alpha.md  score="));
-    assert!(lines[0].ends_with("sqlite vector adapter"));
+    assert_eq!(lines[0], "alpha.md:[f] 1: sqlite vector adapter");
 }
 
 #[test]
@@ -427,8 +546,6 @@ fn concurrent_dirty_searches_do_not_duplicate_passage_embeddings() {
 
     let first_stdout = String::from_utf8(first.stdout).unwrap();
     let second_stdout = String::from_utf8(second.stdout).unwrap();
-    assert!(first_stdout.contains("alpha.md  score="));
-    assert!(second_stdout.contains("alpha.md  score="));
-    assert!(first_stdout.contains("updated sqlite recall"));
-    assert!(second_stdout.contains("updated sqlite recall"));
+    assert!(first_stdout.contains("alpha.md:[rfv] 1: updated sqlite recall"));
+    assert!(second_stdout.contains("alpha.md:[rfv] 1: updated sqlite recall"));
 }

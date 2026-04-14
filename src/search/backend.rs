@@ -11,4 +11,5 @@ pub struct GrepHit {
 
 pub trait ScanBackend {
     fn regex_search(&self, root: &Path, pattern: &str) -> ZgResult<Vec<GrepHit>>;
+    fn literal_search(&self, root: &Path, pattern: &str) -> ZgResult<Vec<GrepHit>>;
 }

@@ -896,10 +896,7 @@ pub(crate) fn status_for_index_root(root: &Path) -> ZgResult<IndexStatus> {
             |row| {
                 let started = row.get::<_, i64>(1)? as u64;
                 let finished = row.get::<_, i64>(2)? as u64;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    finished.saturating_sub(started),
-                ))
+                Ok((row.get::<_, String>(0)?, finished.saturating_sub(started)))
             },
         )
         .optional()?;

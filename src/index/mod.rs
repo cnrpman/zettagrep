@@ -66,8 +66,16 @@ mod tests {
     #[test]
     fn rebuild_batches_embedding_work_across_all_documents() {
         let root = temp_dir("rebuild-batch");
-        fs::write(root.join("alpha.md"), "alpha unique long line one abcdefghijklmnop").unwrap();
-        fs::write(root.join("beta.md"), "beta unique long line two abcdefghijklmnop").unwrap();
+        fs::write(
+            root.join("alpha.md"),
+            "alpha unique long line one abcdefghijklmnop",
+        )
+        .unwrap();
+        fs::write(
+            root.join("beta.md"),
+            "beta unique long line two abcdefghijklmnop",
+        )
+        .unwrap();
 
         super::embed::test_begin_embed_capture_for_current_thread();
         init_hybrid(&root);
@@ -120,7 +128,9 @@ mod tests {
         let hits = search_hybrid(&root, &root, "backoff", 10).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].rel_path, "parser.rs");
-        assert!(hits[0].snippet.contains("parse_query"));
+        assert!(hits[0].snippet.contains("retry_backoff_ms"));
+        assert_eq!(hits[0].line_start, 2);
+        assert_eq!(hits[0].line_end, 2);
     }
 
     #[test]
@@ -144,8 +154,16 @@ mod tests {
     #[test]
     fn reconcile_batches_embedding_work_across_dirty_documents() {
         let root = temp_dir("reconcile-batch");
-        fs::write(root.join("alpha.md"), "alpha baseline long line abcdefghijklmnop").unwrap();
-        fs::write(root.join("beta.md"), "beta baseline long line abcdefghijklmnop").unwrap();
+        fs::write(
+            root.join("alpha.md"),
+            "alpha baseline long line abcdefghijklmnop",
+        )
+        .unwrap();
+        fs::write(
+            root.join("beta.md"),
+            "beta baseline long line abcdefghijklmnop",
+        )
+        .unwrap();
         init_hybrid(&root);
 
         fs::write(
