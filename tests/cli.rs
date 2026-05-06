@@ -140,6 +140,32 @@ fn default_entrypoint_uses_regex_mode_for_regex_shaped_queries() {
 }
 
 #[test]
+fn grep_subcommand_returns_exit_code_one_for_no_match() {
+    let root = temp_dir("grep-no-match");
+    let file = root.join("note.md");
+    fs::write(&file, "alpha\nbeta\n").unwrap();
+
+    let output = zg().args(["grep", "needle"]).arg(&file).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn default_entrypoint_regex_returns_exit_code_one_for_no_match() {
+    let root = temp_dir("default-regex-no-match");
+    let file = root.join("note.md");
+    fs::write(&file, "alpha\nbeta\n").unwrap();
+
+    let output = zg().arg("TODO|FIXME").arg(&file).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn grep_subcommand_supports_context_flags() {
     let root = temp_dir("grep-context");
     let file = root.join("note.md");
@@ -229,7 +255,8 @@ fn grep_subcommand_files_with_matches_outputs_unique_paths() {
     assert!(output.stderr.is_empty());
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines = stdout.lines().collect::<Vec<_>>();
+    let mut lines = stdout.lines().collect::<Vec<_>>();
+    lines.sort();
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0], root.join("alpha.md").display().to_string());
     assert_eq!(lines[1], root.join("beta.md").display().to_string());

@@ -19,6 +19,21 @@ enum SearchMode {
     Indexed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunOutcome {
+    Success,
+    NoMatch,
+}
+
+impl RunOutcome {
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Success => ExitCode::SUCCESS,
+            Self::NoMatch => ExitCode::from(1),
+        }
+    }
+}
+
 #[derive(Debug, Parser, PartialEq)]
 #[command(
     name = "zg",
@@ -302,7 +317,7 @@ enum ProbeCommands {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(outcome) => outcome.exit_code(),
         Err(error) => {
             let rendered = error.to_string();
             if rendered.starts_with("zg:") {
@@ -315,11 +330,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> ZgResult<()> {
+fn run() -> ZgResult<RunOutcome> {
     let args = env::args_os().collect::<Vec<_>>();
     if args.len() == 1 {
         print_help()?;
-        return Ok(());
+        return Ok(RunOutcome::Success);
     }
 
     match parse_cli_from(args) {
@@ -331,7 +346,7 @@ fn run() -> ZgResult<()> {
             ) =>
         {
             print!("{error}");
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Err(error) => Err(error.into()),
     }
@@ -345,7 +360,7 @@ where
     Cli::try_parse_from(args)
 }
 
-fn run_cli(cli: Cli) -> ZgResult<()> {
+fn run_cli(cli: Cli) -> ZgResult<RunOutcome> {
     match cli.command {
         Some(Commands::Grep {
             context,
@@ -381,7 +396,7 @@ fn run_cli(cli: Cli) -> ZgResult<()> {
     }
 }
 
-fn run_index_command(command: IndexCommands) -> ZgResult<()> {
+fn run_index_command(command: IndexCommands) -> ZgResult<RunOutcome> {
     match command {
         IndexCommands::Init { level, force, path } => {
             let root = resolve_dir_arg(path.as_deref())?;
@@ -410,13 +425,13 @@ fn run_index_command(command: IndexCommands) -> ZgResult<()> {
             if let Some(note) = index::best_effort_overlap_note(&root)? {
                 println!("{note}");
             }
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         IndexCommands::Status { path } => {
             let target = resolve_path_arg(path.as_deref())?;
             let status = index::load_status(&target)?;
             print_status(&status);
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         IndexCommands::Rebuild { level, path } => {
             let root = resolve_dir_arg(path.as_deref())?;
@@ -435,7 +450,7 @@ fn run_index_command(command: IndexCommands) -> ZgResult<()> {
             {
                 println!("{note}");
             }
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         IndexCommands::Delete { path } => {
             let root = resolve_dir_arg(path.as_deref())?;
@@ -444,7 +459,7 @@ fn run_index_command(command: IndexCommands) -> ZgResult<()> {
             } else {
                 println!("{}", messages::no_local_cache(&root));
             }
-            Ok(())
+            Ok(RunOutcome::Success)
         }
     }
 }
@@ -466,7 +481,7 @@ fn maybe_print_vector_index_start_notice(root: &Path, index_level: IndexLevel, o
     }
 }
 
-fn run_dev_command(command: DevCommands) -> ZgResult<()> {
+fn run_dev_command(command: DevCommands) -> ZgResult<RunOutcome> {
     match command {
         DevCommands::SampleVault { command } => match command {
             SampleVaultCommands::Ensure {
@@ -486,7 +501,7 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
                         ensured.commit
                     );
                 }
-                Ok(())
+                Ok(RunOutcome::Success)
             }
         },
         DevCommands::Bench { command } => match command {
@@ -514,7 +529,7 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
                 } else {
                     print!("{}", format_sample_vault_benchmark(&report));
                 }
-                Ok(())
+                Ok(RunOutcome::Success)
             }
         },
         DevCommands::Eval { command } => match command {
@@ -538,7 +553,7 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
                             vault_root.display()
                         );
                     }
-                    return Ok(());
+                    return Ok(RunOutcome::Success);
                 }
 
                 let report = dev::run_search_quality_suite(&fixture, Some(&golden), &vault_root)?;
@@ -548,7 +563,7 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
                     print!("{}", format_search_quality_report(&report));
                 }
                 if report.passed() {
-                    Ok(())
+                    Ok(RunOutcome::Success)
                 } else {
                     Err(other("search quality evaluation failed"))
                 }
@@ -562,7 +577,7 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
                 } else {
                     print!("{}", format_chunk_probe(&report));
                 }
-                Ok(())
+                Ok(RunOutcome::Success)
             }
             ProbeCommands::DbCache { path, limit, json } => {
                 let report = dev::probe_db_cache(&path, limit)?;
@@ -571,7 +586,7 @@ fn run_dev_command(command: DevCommands) -> ZgResult<()> {
                 } else {
                     print!("{}", format_db_cache_probe(&report));
                 }
-                Ok(())
+                Ok(RunOutcome::Success)
             }
         },
     }
@@ -583,15 +598,18 @@ fn run_grep(
     context: search::SearchContext,
     ignore_case: bool,
     files_with_matches: bool,
-) -> ZgResult<()> {
+) -> ZgResult<RunOutcome> {
     let root = resolve_path_arg(path)?;
     let hits = search::regex_search(pattern, &root, context, ignore_case)?;
+    if hits.is_empty() {
+        return Ok(RunOutcome::NoMatch);
+    }
     if files_with_matches {
         print!(
             "{}",
             render_matching_paths(hits.into_iter().map(|hit| hit.path.display().to_string()))
         );
-        return Ok(());
+        return Ok(RunOutcome::Success);
     }
     let hits = hits
         .into_iter()
@@ -603,7 +621,7 @@ fn run_grep(
         })
         .collect::<Vec<_>>();
     print!("{}", render_search_hits(&hits, SearchOutputStyle::detect()));
-    Ok(())
+    Ok(RunOutcome::Success)
 }
 
 fn run_search(
@@ -611,7 +629,7 @@ fn run_search(
     path: Option<&Path>,
     context: search::SearchContext,
     files_with_matches: bool,
-) -> ZgResult<()> {
+) -> ZgResult<RunOutcome> {
     let requested = resolve_path_arg(path)?;
     let root = index::require_index_root_for_search(&requested)?;
     index::reconcile_covering_roots(&requested)?;
@@ -622,7 +640,7 @@ fn run_search(
             "{}",
             render_matching_paths(hits.into_iter().map(|hit| hit.rel_path))
         );
-        return Ok(());
+        return Ok(RunOutcome::Success);
     }
     let hits = hits
         .into_iter()
@@ -640,7 +658,7 @@ fn run_search(
         })
         .collect::<Vec<_>>();
     print!("{}", render_search_hits(&hits, SearchOutputStyle::detect()));
-    Ok(())
+    Ok(RunOutcome::Success)
 }
 
 #[derive(Clone, Debug, PartialEq)]

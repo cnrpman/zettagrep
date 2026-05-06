@@ -16,8 +16,8 @@ use super::db::{
     validate_schema, with_write_transaction_retry, write_state_snapshot,
 };
 use super::files::{
-    collect_candidate_files, collect_scope_candidates, estimate_indexable_chunks,
-    load_indexable_documents,
+    collect_candidate_files, collect_scope_possible_candidates, estimate_indexable_chunks,
+    is_content_candidate, load_indexable_documents,
 };
 use super::types::{
     DEFAULT_INDEX_LEVEL, FTS_PROMPT_MAX_CHUNKS, IndexLevel, IndexStatus, IndexedDocument,
@@ -293,9 +293,8 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
         dirty_reason: None,
         last_sync_unix_ms: None,
     });
-    let candidate_files = collect_scope_candidates(&root, &scope)?;
-    let mut dirty_paths = Vec::new();
-    let mut dirty_rel_paths = Vec::new();
+    let candidate_files = collect_scope_possible_candidates(&root, &scope)?;
+    let mut pending_loads = Vec::new();
     let mut seen = HashSet::new();
     let mut pending_upserts = Vec::new();
     let mut pending_deletes = Vec::new();
@@ -307,8 +306,6 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
 
     for path in candidate_files {
         let rel_path = relative_path_string(&root, &path)?;
-        seen.insert(rel_path.clone());
-
         let metadata = fs::metadata(&path)?;
         let modified_unix_ms = modified_unix_ms(&metadata)?;
         let size_bytes = metadata.len();
@@ -316,30 +313,38 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
         if row.is_some_and(|value| {
             value.size_bytes == size_bytes && value.modified_unix_ms == modified_unix_ms
         }) {
+            seen.insert(rel_path);
             continue;
         }
 
-        dirty_rel_paths.push(rel_path);
-        dirty_paths.push(path);
+        if !is_content_candidate(&path)? {
+            continue;
+        }
+
+        seen.insert(rel_path.clone());
+        pending_loads.push(PendingLoad { rel_path, path });
     }
 
+    let dirty_paths = pending_loads
+        .iter()
+        .map(|pending| pending.path.clone())
+        .collect::<Vec<_>>();
     let loaded_documents = load_indexable_documents(&dirty_paths)?;
-    for ((rel_path, path), document) in dirty_rel_paths
-        .into_iter()
-        .zip(dirty_paths.into_iter())
-        .zip(loaded_documents.into_iter())
-    {
+    for (pending, document) in pending_loads.into_iter().zip(loaded_documents.into_iter()) {
         match document {
             Some(document) => {
                 stats.indexed_files += 1;
                 stats.chunks_indexed += document.chunks.len();
-                pending_upserts.push(PendingDocument { rel_path, document });
+                pending_upserts.push(PendingDocument {
+                    rel_path: pending.rel_path,
+                    document,
+                });
             }
             None => {
-                pending_deletes.push(rel_path.clone());
+                pending_deletes.push(pending.rel_path.clone());
                 stats.warnings.push(format!(
                     "skipped unreadable or disallowed file {}",
-                    path.display()
+                    pending.path.display()
                 ));
             }
         }
@@ -402,6 +407,11 @@ fn reconcile_scope_for_root(root: &Path, scope: &Path) -> ZgResult<SyncStats> {
 struct PendingDocument {
     rel_path: String,
     document: IndexedDocument,
+}
+
+struct PendingLoad {
+    rel_path: String,
+    path: PathBuf,
 }
 
 #[cfg(test)]

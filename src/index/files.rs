@@ -57,11 +57,14 @@ pub fn collect_candidate_files(scope: &Path) -> ZgResult<Vec<PathBuf>> {
     Ok(files)
 }
 
-pub(crate) fn collect_scope_candidates(root: &Path, scope: &Path) -> ZgResult<Vec<PathBuf>> {
+pub(crate) fn collect_scope_possible_candidates(
+    root: &Path,
+    scope: &Path,
+) -> ZgResult<Vec<PathBuf>> {
     let scope = paths::resolve_existing_path(scope)?;
     if scope.is_file() {
         return Ok(
-            if scope.starts_with(root) && candidate_file_size(&scope)?.is_some() {
+            if scope.starts_with(root) && candidate_file_metadata_size(&scope)?.is_some() {
                 vec![scope]
             } else {
                 Vec::new()
@@ -69,11 +72,30 @@ pub(crate) fn collect_scope_candidates(root: &Path, scope: &Path) -> ZgResult<Ve
         );
     }
 
-    let files = collect_candidate_files(&scope)?;
-    Ok(files
-        .into_iter()
-        .filter(|path| path.starts_with(root))
-        .collect::<Vec<_>>())
+    let mut builder = WalkBuilder::new(&scope);
+    walk::apply_content_filters(&mut builder);
+
+    let mut files = Vec::new();
+    for entry in builder.build() {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if !path.starts_with(root) || file_type.is_symlink() || has_zg_component(path) {
+            continue;
+        }
+        if file_type.is_file() && candidate_file_metadata_size(path)?.is_some() {
+            files.push(path.to_path_buf());
+        }
+    }
+
+    Ok(files)
+}
+
+pub(crate) fn is_content_candidate(path: &Path) -> ZgResult<bool> {
+    Ok(candidate_file_size(path)?.is_some())
 }
 
 pub(crate) fn load_indexable_document(path: &Path) -> ZgResult<Option<IndexedDocument>> {
@@ -305,6 +327,19 @@ fn strip_line_decorator(line: &str) -> &str {
 }
 
 fn candidate_file_size(path: &Path) -> ZgResult<Option<u64>> {
+    let Some(size_bytes) = candidate_file_metadata_size(path)? else {
+        return Ok(None);
+    };
+
+    let bytes = fs::read(path)?;
+    if !bytes_are_text_whitelisted(&bytes) {
+        return Ok(None);
+    }
+
+    Ok(Some(size_bytes))
+}
+
+fn candidate_file_metadata_size(path: &Path) -> ZgResult<Option<u64>> {
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > DEFAULT_MAX_FILE_BYTES {
         return Ok(None);
@@ -329,11 +364,6 @@ fn candidate_file_size(path: &Path) -> ZgResult<Option<u64>> {
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(file_name));
     if !allowed {
-        return Ok(None);
-    }
-
-    let bytes = fs::read(path)?;
-    if !bytes_are_text_whitelisted(&bytes) {
         return Ok(None);
     }
 

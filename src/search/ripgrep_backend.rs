@@ -29,14 +29,7 @@ impl ScanBackend for RipgrepScanBackend {
         }
 
         let rg = resolve_rg_binary()?;
-        let mut hits = run_rg(&rg, pattern, &root, false, context, ignore_case)?;
-        hits.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.line_number.cmp(&right.line_number))
-                .then_with(|| left.line.cmp(&right.line))
-        });
-        Ok(hits)
+        run_rg(&rg, pattern, &root, false, context, ignore_case)
     }
 
     fn literal_search(&self, root: &Path, pattern: &str) -> ZgResult<Vec<GrepHit>> {

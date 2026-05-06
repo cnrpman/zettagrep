@@ -314,6 +314,26 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_ignores_new_non_indexable_files_without_dirtying_index() {
+        let root = temp_dir("reconcile-ignore-new-invalid");
+        fs::write(root.join("alpha.md"), "sqlite vector adapter").unwrap();
+        init_index(&root).unwrap();
+
+        fs::write(root.join("noise.md"), [0xff, 0xfe, 0xfd, 0xfc]).unwrap();
+        reconcile_covering_roots(&root).unwrap();
+
+        let status = load_status(&root).unwrap();
+        assert!(!status.dirty);
+        assert_eq!(status.file_count, 1);
+
+        let conn = super::db::open_existing_db(&root).unwrap();
+        let indexed_files = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(indexed_files, 1);
+    }
+
+    #[test]
     fn status_marks_vector_backend_unready_when_vec_index_drifts() {
         let root = temp_dir("vector-ready");
         fs::write(root.join("alpha.md"), "sqlite :: vector adapter").unwrap();
